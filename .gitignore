@@ -1,0 +1,19 @@
+# ===== Python =====
+AIpy/.venv/
+AIpy/**/__pycache__/
+AIpy/**/*.pyc
+AIpy/.env
+AIpy/.python-version
+
+# ===== C# =====
+stardewAI/**/bin/
+stardewAI/**/obj/
+stardewAI/**/*.zip
+stardewAI/.inspect/
+
+# ===== 通用 =====
+.vs/
+.idea/
+*.log
+.DS_Store
+Thumbs.db

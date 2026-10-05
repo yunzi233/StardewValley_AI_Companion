@@ -2,7 +2,7 @@
   "Name": "Stardew AI Assistant",
   "Author": "yz",
   "Version": "1.0.0",
-  "Description": "我的第一个AI陪玩Mod",
+  "Description": "星露谷物语AI陪玩Mod",
   "UniqueID": "yz.StardewAIAssistant",
   "EntryDll": "StardewAIAssistant.dll",
   "MinimumApiVersion": "4.0.0",

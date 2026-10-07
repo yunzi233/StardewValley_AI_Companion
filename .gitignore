@@ -4,6 +4,8 @@ AIpy/**/__pycache__/
 AIpy/**/*.pyc
 AIpy/.env
 AIpy/.python-version
+# RAG 向量库：本地由建库脚本生成，不随仓库分发
+AIpy/chroma_db/
 
 # ===== C# =====
 stardewAI/**/bin/

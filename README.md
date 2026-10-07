@@ -1,27 +1,36 @@
 # 星露谷 AI 陪玩 Mod（Stardew AI Companion）
 
-一个由 **SMAPI Mod（C#）+ 本地 Python AI 后端（FastAPI + LangChain）** 组成的星露谷物语 AI 陪伴系统。
+一个由 **SMAPI Mod（C#）+ 本地 Python AI 后端（FastAPI + LangChain）** 组成的星露谷物语 AI 陪伴系统，**支持 RAG 知识库检索**（ChromaDB + bge-m3）。
 
-按下 **F7** 呼叫你的 AI 伴侣，它会实时读取你的游戏状态（名字、体力、时间、地点）并给出回应。
+按下 **F7** 呼叫你的 AI 伴侣，它会实时读取你的游戏状态（名字、体力、时间、地点），检索本地游戏知识库，并给出基于资料的回答。
 
 > **最终目标**：让一个漂浮在玩家身旁的小机器人陪伴你冒险——它感知玩家状态机，结合游戏知识库（RAG）进行多轮智能对话。
 
 ---
 
-## 当前版本状态（v0.2 · 接入本地 LLM）
+## 当前进度（v0.3 · RAG 知识库跑通）
 
-- ✅ C# Mod：F7 按键 → 收集玩家状态 → 异步请求后端 → HUD 显示回复
-- ✅ Python 后端：`POST /chat` 接收状态，通过 **LangChain 调用本地 Ollama 模型**（`qwen2.5:3b`）生成回复
-- ✅ 游戏内可看到 AI 结合实时玩家状态生成的回答
-- ⚠️ `emotion` 字段仍固定为 `happy`，尚未接表情/立绘
+**✅ 已完成：**
+- 端到端通信（C# ↔ Python，HTTP + JSON）
+- 接入本地 Ollama 模型（`qwen2.5:3b`）
+- RAG 知识库（ChromaDB + bge-m3 嵌入，已收录作物 / 鱼类 / NPC 礼物）
+- 游戏状态感知（名字 / 体力 / 时间 / 地点）
+
+**⏳ 规划中：**
+- 多轮记忆（LangGraph）
+- 浮动精灵 + 主动提醒
+- BYOK（玩家自带 API Key，云端 / 本地双模式）
+- 扩展游戏状态（季节 / 天气 / 金币等）
+- 游戏内输入框（当前按 F7 轮流发送内置测试问题，还不能自由打字）
 
 ## 架构
 
 ```mermaid
 flowchart LR
     A[玩家按 F7] --> B[C# Mod<br/>ModEntry.cs]
-    B -->|收集状态| C[GameStateData<br/>名字/体力/时间/地点]
-    C -->|HTTP POST /chat| D[Python 后端<br/>FastAPI :8000 + LangChain]
+    B -->|状态 + Message| C[HTTP POST /chat<br/>FastAPI :8000]
+    C --> R[ChromaDB 检索<br/>bge-m3 向量 / top-3 片段]
+    R -->|参考资料| D[LangChain 拼装提示词]
     D -->|调用| D2[本地 Ollama<br/>qwen2.5:3b]
     D2 -->|reply + emotion| E[主线程任务队列]
     E -->|UpdateTicked| F[游戏内 HUD 消息]
@@ -30,7 +39,8 @@ flowchart LR
 **关键设计**：
 - `await` 之后的代码运行在线程池后台线程，所有 HUD 操作通过主线程任务队列（`Queue<Action>` + `UpdateTicked`）调度回游戏主线程执行，避免随机崩溃
 - 全局复用单个 `HttpClient`，15 秒超时，请求期间游戏照常运行不卡顿
-- 后端将游戏状态拼装为提示词注入 LLM，System Prompt 约束角色设定（亲切简短、1-2 句话、禁止编造游戏信息）
+- 向量库在后端启动时只加载一次；每次请求先做向量检索（top-3），把参考资料片段和游戏状态一起注入提示词
+- System Prompt 严格约束：游戏知识必须依据参考资料回答，资料里没有就直说"我不太清楚"；向量检索不擅长的逻辑条件（如"晴天"误召回"雨天"鱼）交给 LLM 二次筛选
 - 未进入存档时按 F7 会友好提示，不会崩溃
 
 ## 目录结构
@@ -38,16 +48,36 @@ flowchart LR
 ```
 AI_Projects/
 ├── AIpy/                      # Python AI 后端
-│   ├── main.py                # 入口：FastAPI 应用，POST /chat
-│   └── pyproject.toml         # uv 依赖管理（fastapi / pydantic / uvicorn）
+│   ├── main.py                # 入口：FastAPI + RAG 检索 + LLM 调用，POST /chat
+│   ├── pyproject.toml         # uv 依赖管理
+│   ├── wiki_data/             # 知识库源文件（Markdown，随仓库分发）
+│   │   ├── crops.md           # 四季作物
+│   │   ├── fish.md            # 鱼类图鉴
+│   │   └── gift.md            # NPC 礼物偏好
+│   ├── src/aipy/
+│   │   └── build_knowledge_base.py  # 建库脚本：wiki_data → chroma_db
+│   └── chroma_db/             # 向量库（脚本本地生成，已 gitignore）
 ├── stardewAI/                 # C# SMAPI Mod
 │   ├── ModTemplate/
-│   │   ├── ModEntry.cs        # Mod 入口：F7 流程、线程队列、HTTP 请求
+│   │   ├── ModEntry.cs        # Mod 入口：F7 流程、测试问题池、线程队列、HTTP 请求
 │   │   ├── manifest.json      # SMAPI 清单（UniqueID: yz.StardewAIAssistant）
 │   │   └── StardewAIAssistant.csproj
+│   ├── DESIGN.md              # 设计蓝图（模块规划与数据流）
 │   └── NOTES.md               # 开发笔记（踩坑记录，值得一看）
 └── .gitignore
 ```
+
+## 技术栈
+
+**C# 端（SMAPI Mod）**
+- .NET 6 / C#、SMAPI 4.x、`System.Net.Http.HttpClient` + `System.Text.Json`
+- NuGet：`Pathoschild.Stardew.ModBuildConfig` 4.1.0
+
+**Python 端（AI 后端）**
+- Web：FastAPI + Uvicorn，依赖管理用 uv
+- LLM 编排：LangChain（`langchain-ollama` / `langchain-chroma` / `langchain-text-splitters`），LangGraph 已引入（多轮记忆规划中）
+- 向量库：ChromaDB（本地持久化，无需起数据库服务）
+- 模型（均通过本地 Ollama）：`qwen2.5:3b`（对话）+ `bge-m3`（嵌入/向量化）
 
 ## 环境要求
 
@@ -57,29 +87,54 @@ AI_Projects/
 | SMAPI | 4.x（MinimumApiVersion 4.0.0） |
 | .NET SDK | 6.0（编译 Mod） |
 | Python | ≥ 3.11，使用 [uv](https://docs.astral.sh/uv/) 管理依赖 |
-| [Ollama](https://ollama.com/) | 本地推理服务，模型 `qwen2.5:3b`（默认端口 11434） |
+| [Ollama](https://ollama.com/) | 本地推理服务（默认端口 11434），需拉取 `qwen2.5:3b` 与 `bge-m3` 两个模型 |
 
 ## 快速开始
 
 ### 1. 准备本地 Ollama
 
-安装 [Ollama](https://ollama.com/download) 并拉取模型（首次需联网下载）：
+安装 [Ollama](https://ollama.com/download) 并拉取两个模型（首次需联网下载）：
 
 ```bash
-ollama pull qwen2.5:3b
+ollama pull qwen2.5:3b   # 对话模型
+ollama pull bge-m3       # 嵌入模型（知识库向量化用）
 ```
 
 Ollama 安装后一般会自动在后台运行（默认端口 `11434`）；若没有，手动执行 `ollama serve`。
 
-### 2. 启动 AI 后端
+### 2. 准备知识库（首次必做）
+
+知识库源文件放在 `AIpy/wiki_data/`，为 **UTF-8 编码的 Markdown**：
+
+- 建库脚本按 `##`（二级标题）切块，**每个 `##` 小节成为一个 chunk**
+- 每个 chunk 必须自包含：标题里的限定信息（如"春季作物""XX 的礼物偏好"）要留在正文中，不能只写一个孤立的"# 春季作物"
+- 玩家可能提问的关键词（如"礼物""晴天"）应直接出现在对应 chunk 的标题或正文里，否则向量检索召不回
+- 现有三份：[crops.md](AIpy/wiki_data/crops.md)（作物）、[fish.md](AIpy/wiki_data/fish.md)（鱼类）、[gift.md](AIpy/wiki_data/gift.md)（NPC 礼物），可直接照格式扩充
+
+运行建库脚本（在 `AIpy/` 目录下）：
+
+```bash
+uv sync                                                      # 首次安装依赖
+uv run python src/aipy/build_knowledge_base.py
+```
+
+脚本会：读取 `wiki_data/*.md` → 按 `##` 切块（保留标题）→ bge-m3 向量化 → 写入 `chroma_db/`，末尾还会跑一条自测查询打印命中块。
+
+> 注意：
+> - 脚本采用**全量重建**（先删除旧 `chroma_db/` 再写入），修改 wiki 后重跑即可，不会产生重复数据
+> - 首次向量化较慢（bge-m3 要逐个 chunk 编码），属正常现象
+> - `chroma_db/` 是本地生成物，**不随仓库分发**（已加入 `.gitignore`），换机器或重新克隆后必须重新建库，否则后端启动/检索会报错
+
+### 3. 启动 AI 后端
 
 ```bash
 cd AIpy
-uv sync                                  # 首次安装依赖（含 langchain / langchain-ollama）
 uv run uvicorn main:app --port 8000      # 启动服务（调试可加 --reload）
 ```
 
-### 3. 编译并部署 Mod
+启动日志出现「向量库加载完成」即表示 ChromaDB 正常载入。
+
+### 4. 编译并部署 Mod
 
 ```bash
 cd stardewAI/ModTemplate
@@ -91,12 +146,13 @@ dotnet build
 - ⚠️ 游戏/SMAPI 开着时 build 会因 DLL 被占用而失败，请先关闭游戏
 - 只想验证语法、不部署：`dotnet build -p:EnableModDeploy=false -p:EnableModZip=false`
 
-### 4. 开始对话
+### 5. 开始对话
 
 1. 启动 SMAPI 进入游戏
 2. 读取存档（主菜单中按 F7 只会得到提示）
-3. 按 **F7**，左上角 HUD 会先显示「AI伴侣正在思考中...」，随后显示回复
-4. SMAPI 控制台可查看状态收集与后端返回的详细日志
+3. 按 **F7**，HUD 会先显示本次轮到的测试问题和「AI伴侣正在思考中...」，随后显示基于知识库的回复
+4. 当前版本每按一次 F7 轮流发送内置问题池中的一个问题（共 5 个），用于验证 RAG 链路；游戏内自由输入框还未实现
+5. SMAPI 控制台与后端终端可查看状态收集、检索命中块数与返回内容
 
 ## 通信协议（C# ⇄ Python）
 
@@ -105,8 +161,11 @@ dotnet build
 **请求**（PascalCase，与 C# `System.Text.Json` 默认序列化对齐）：
 
 ```json
-{ "PlayerName": "农夫", "Stamina": 87.5, "GameTime": 1330, "Location": "Farm" }
+{ "PlayerName": "农夫", "Stamina": 87.5, "GameTime": 1330, "Location": "Farm", "Message": "海莉喜欢什么礼物？" }
 ```
+
+- `Message` 为玩家问题；后端优先用它做检索，为空时回退为当前场景描述（地点/时间/体力）
+- 当前版本 `Message` 由 C# 端的测试问题池轮流填充
 
 **响应**（小写键名，C# 端通过 `PropertyNameCaseInsensitive` 映射）：
 
@@ -121,12 +180,13 @@ dotnet build
 ## Roadmap
 
 - [x] 接入真实 LLM：本地 Ollama + LangChain（`qwen2.5:3b`）
-- [ ] 模型与参数可配置化（当前写死 `qwen2.5:3b`、`temperature=0.7`）
+- [x] RAG 知识库：ChromaDB + bge-m3，已收录作物 / 鱼类 / NPC 礼物
+- [ ] 游戏内输入框：F7 弹窗打字（SMAPI 中文 IME 需接管 Window.TextInput），替代测试问题池
+- [ ] 模型与参数可配置化（当前写死 `qwen2.5:3b`、`temperature=0.7`、top-3）
 - [ ] 漂浮机器人：贴图渲染、跟随玩家移动、待机动画
 - [ ] 防连点：思考中再按 F7 忽略或排队
 - [ ] 扩充状态感知：季节、天气、金币、背包、NPC 好感、当日任务
-- [ ] 多轮对话记忆（当前每请求独立）
-- [ ] RAG 知识库：游戏知识 + 玩家档案检索
+- [ ] 多轮对话记忆（LangGraph，当前每请求独立）
 - [ ] F7 改键写入 config.json，避免与其他 Mod 冲突
 - [ ] `emotion` 字段驱动机器人表情 / 立绘变化
 
@@ -136,7 +196,11 @@ dotnet build
 |---|---|
 | HUD 提示「AI大脑连接失败」 | Python 后端未启动或端口不是 8000，先启动后端 |
 | 后端日志报 Ollama 连接错误 | Ollama 服务未运行（默认端口 11434），执行 `ollama serve` |
-| 按 F7 后回复很慢 | 首次调用需把模型加载进内存/显存，属正常现象；可先 `ollama run qwen2.5:3b` 预热，推理速度取决于本地硬件 |
+| 后端启动报找不到 `chroma_db` / 集合为空 | 还没建知识库，先跑 `uv run python src/aipy/build_knowledge_base.py` |
+| 建库时报 `model "bge-m3" not found` | 嵌入模型没拉取，执行 `ollama pull bge-m3` |
+| 检索结果答非所问 | 检查 wiki 对应 chunk 是否自包含、是否含玩家提问的关键词；向量检索不懂逻辑条件，靠 LLM 二次筛选，详见 [NOTES.md](stardewAI/NOTES.md) |
+| 按 F7 后回复很慢 | 首次调用需把对话/嵌入模型加载进内存/显存，属正常现象；可先 `ollama run qwen2.5:3b` 预热，推理速度取决于本地硬件 |
+| 改了 C# 代码游戏里没生效 | 忘记 `dotnet build`，游戏跑的还是 Mods 目录里的旧 DLL |
 | HUD 提示「响应超时」 | 后端卡住超过 15 秒，检查后端控制台日志 |
 | `dotnet build` 报 `UnauthorizedAccessException` | 游戏/SMAPI 正在运行占用 DLL，先关闭游戏 |
 | 游戏内 HUD 文字无法自定义颜色 | 游戏本体 1.6.15 移除了 `HUDMessage.color`，错误提示改用 `error_type` 图标 |

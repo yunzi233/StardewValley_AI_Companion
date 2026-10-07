@@ -59,6 +59,24 @@ namespace StardewAIAssistant
         /// </summary>
         private readonly Queue<Action> _mainThreadActions = new();
 
+        /// <summary>
+        /// 【新增】预设的测试问题池。每次按 F7 轮流取一个发给 Python 后端。
+        /// </summary>
+        private static readonly string[] TestQuestions =
+        {
+            "夏季晴天能钓什么鱼？",
+            "海莉喜欢什么礼物？",
+            "春季种什么最赚钱？",
+            "亚历克斯的生日是什么时候？",
+            "太阳鱼在什么地方钓？"
+        };
+
+        /// <summary>
+        /// 【新增】当前轮到问题池里的第几个问题。
+        /// 按下 F7 后取余自增，实现 0→1→...→4→0 循环。
+        /// </summary>
+        private int _questionIndex = 0;
+
         public override void Entry(IModHelper helper)
         {
             // 1. 保留原有 F7 按键监听（事件处理器用 async void 是 C# 的标准写法）
@@ -85,6 +103,15 @@ namespace StardewAIAssistant
                 return;
             }
 
+            // ========== 【新增】从测试问题池轮流取一个问题 ==========
+            // 先按当前索引取出问题，再让索引 +1 并对数组长度取余，
+            // 这样问到最后一个后会自动回到第 0 个，循环使用。
+            string question = TestQuestions[_questionIndex];
+            _questionIndex = (_questionIndex + 1) % TestQuestions.Length;
+
+            // 按下 F7 先在 HUD 里显示本次问的内容，方便调试确认轮到了哪个问题
+            Game1.addHUDMessage(new HUDMessage($"玩家问：{question}"));
+
             // ========== 第 1 步：在游戏主线程收集当前游戏状态 ==========
             // （此方法在 await 之前的部分都运行在游戏主线程，可以安全读取游戏数据）
             GameStateData state = new()
@@ -92,7 +119,8 @@ namespace StardewAIAssistant
                 PlayerName = Game1.player.Name,          // 玩家名字
                 Stamina = Game1.player.Stamina,         // 当前体力（float 类型）
                 GameTime = Game1.timeOfDay,             // 当前游戏时间（int，如 600 表示早上 6:00）
-                Location = Game1.currentLocation.Name   // 当前地点（如 "Farm"；如需区分同名室内建筑可改用 NameOrUniqueName）
+                Location = Game1.currentLocation.Name,  // 当前地点（如 "Farm"；如需区分同名室内建筑可改用 NameOrUniqueName）
+                Message = question                      // 【新增】本次轮到的测试问题，随 JSON 的 Message 字段一起发给后端
             };
             this.Monitor.Log(
                 $"[AI伴侣] 收集状态：玩家={state.PlayerName}，体力={state.Stamina}，时间={state.GameTime}，地点={state.Location}",
@@ -106,7 +134,7 @@ namespace StardewAIAssistant
             {
                 // 把状态对象序列化为 JSON。
                 // System.Text.Json 默认保持属性原名，因此输出：
-                // {"PlayerName":"...","Stamina":100.0,"GameTime":600,"Location":"Farm"}
+                // {"PlayerName":"...","Stamina":100.0,"GameTime":600,"Location":"Farm","Message":"..."}
                 string requestJson = JsonSerializer.Serialize(state);
 
                 // 构造请求体：JSON 字符串 + UTF-8 编码 + application/json 媒体类型
@@ -213,7 +241,7 @@ namespace StardewAIAssistant
 
         /// <summary>
         /// 发送给 Python 后端的游戏状态数据结构。
-        /// 序列化后字段名为：PlayerName / Stamina / GameTime / Location。
+        /// 序列化后字段名为：PlayerName / Stamina / GameTime / Location / Message。
         /// </summary>
         private sealed class GameStateData
         {
@@ -221,6 +249,9 @@ namespace StardewAIAssistant
             public float Stamina { get; set; }
             public int GameTime { get; set; }
             public string Location { get; set; } = string.Empty;
+
+            /// <summary>【新增】玩家本次问的问题（取自测试问题池）。</summary>
+            public string Message { get; set; } = string.Empty;
         }
 
         /// <summary>

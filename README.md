@@ -2,25 +2,25 @@
 
 一个由 **SMAPI Mod（C#）+ 本地 Python AI 后端（FastAPI + LangChain）** 组成的星露谷物语 AI 陪伴系统，**支持 RAG 知识库检索**（ChromaDB + bge-m3）。
 
-按下 **F7** 呼叫你的 AI 伴侣，它会实时读取你的游戏状态（名字、体力、时间、地点），检索本地游戏知识库，并给出基于资料的回答。
+按下 **F7** 呼叫你的 AI 伴侣，它会实时读取你的游戏状态（名字、体力、血量、时间、日期、季节、天气、地点、金币），检索本地游戏知识库，并给出基于资料的回答。
 
 > **最终目标**：让一个漂浮在玩家身旁的小机器人陪伴你冒险——它感知玩家状态机，结合游戏知识库（RAG）进行多轮智能对话。
 
 ---
 
-## 当前进度（v0.3 · RAG 知识库跑通）
+## 当前进度（v0.4 · 扩展游戏状态感知）
 
 **✅ 已完成：**
 - 端到端通信（C# ↔ Python，HTTP + JSON）
 - 接入本地 Ollama 模型（`qwen2.5:3b`）
 - RAG 知识库（ChromaDB + bge-m3 嵌入，已收录作物 / 鱼类 / NPC 礼物）
-- 游戏状态感知（名字 / 体力 / 时间 / 地点）
+- 游戏状态感知：名字 / 体力 / 血量 / 游戏时间 / 日期（1-28）/ 季节 / 是否下雨 / 地点 / 金币
 
 **⏳ 规划中：**
 - 多轮记忆（LangGraph）
 - 浮动精灵 + 主动提醒
 - BYOK（玩家自带 API Key，云端 / 本地双模式）
-- 扩展游戏状态（季节 / 天气 / 金币等）
+- 继续扩展状态（背包 / 当前工具 / NPC 好感 / 当日任务）
 - 游戏内输入框（当前按 F7 轮流发送内置测试问题，还不能自由打字）
 
 ## 架构
@@ -161,10 +161,32 @@ dotnet build
 **请求**（PascalCase，与 C# `System.Text.Json` 默认序列化对齐）：
 
 ```json
-{ "PlayerName": "农夫", "Stamina": 87.5, "GameTime": 1330, "Location": "Farm", "Message": "海莉喜欢什么礼物？" }
+{
+  "PlayerName": "农夫", "Stamina": 87.5, "Health": 100,
+  "GameTime": 1330, "DayOfMonth": 12,
+  "Season": "summer", "IsRaining": false,
+  "Location": "Farm", "Money": 5320,
+  "Message": "海莉喜欢什么礼物？"
+}
 ```
 
-- `Message` 为玩家问题；后端优先用它做检索，为空时回退为当前场景描述（地点/时间/体力）
+字段说明：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `PlayerName` | string | 玩家名字 |
+| `Stamina` | float | 当前体力 |
+| `Health` | int | 当前血量（上限 100） |
+| `GameTime` | int | 游戏内时间，`600` = 早上 6:00 |
+| `DayOfMonth` | int | 当月第几天（1-28，星露谷每月 28 天） |
+| `Season` | string | 季节：`spring` / `summer` / `fall` / `winter` |
+| `IsRaining` | bool | 今天是否下雨 |
+| `Location` | string | 当前地点（如 `Farm`） |
+| `Money` | int | 当前金币 |
+| `Message` | string | 玩家问题 |
+
+- `Message` 为玩家问题；后端优先用它做向量检索，为空时回退为当前场景描述（地点/时间/体力）
+- 其余状态字段**不参与检索**，由后端整理成结构化中文状态块（季节会译为"春季"、`IsRaining` 译为"正在下雨/天气晴朗"）注入 LLM 提示词
 - 当前版本 `Message` 由 C# 端的测试问题池轮流填充
 
 **响应**（小写键名，C# 端通过 `PropertyNameCaseInsensitive` 映射）：
@@ -185,7 +207,8 @@ dotnet build
 - [ ] 模型与参数可配置化（当前写死 `qwen2.5:3b`、`temperature=0.7`、top-3）
 - [ ] 漂浮机器人：贴图渲染、跟随玩家移动、待机动画
 - [ ] 防连点：思考中再按 F7 忽略或排队
-- [ ] 扩充状态感知：季节、天气、金币、背包、NPC 好感、当日任务
+- [x] 扩充状态感知（第一批）：季节、天气、日期、金币、血量（C# 收集 + Python 注入提示词）
+- [ ] 扩充状态感知（第二批）：背包、当前工具、NPC 好感、当日任务；并让季节/天气参与检索 query
 - [ ] 多轮对话记忆（LangGraph，当前每请求独立）
 - [ ] F7 改键写入 config.json，避免与其他 Mod 冲突
 - [ ] `emotion` 字段驱动机器人表情 / 立绘变化

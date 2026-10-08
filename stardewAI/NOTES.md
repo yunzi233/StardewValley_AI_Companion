@@ -108,8 +108,8 @@
 | `OnButtonPressed` | L92 | F7 主流程：取测试问题→安检→收集状态（含 Message）→弹"思考中"→异步 POST→解析→投递 HUD |
 | `OnUpdateTicked` | L199 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
 | `EnqueueHudMessage` | L227 | 把显示 HUD 的动作打包入队（可在后台线程调） |
-| `GameStateData`（内部类） | L246 | 发给后端的模型：PlayerName/Stamina/GameTime/Location/**Message**(L254) |
-| `ChatResponse`（内部类） | L261 | 后端返回模型：Reply/Emotion |
+| `GameStateData`（内部类） | L254 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message(L261-262) + 扩展 Season/IsRaining/DayOfMonth/Money/Health(L264-278) |
+| `ChatResponse`（内部类） | L285 | 后端返回模型：Reply/Emotion |
 
 ### Python 端：`AIpy/main.py`（RAG 检索主逻辑）
 
@@ -118,12 +118,13 @@
 | 向量库初始化 | L13-23 | 模块级只跑一次：`CHROMA_DIR` → `OllamaEmbeddings(bge-m3)` → `Chroma(collection_name="stardew_wiki")` → `retriever`（k=3） |
 | `llm` | L26 | 对话模型 `ChatOllama(qwen2.5:3b, temperature=0.7)` |
 | `SYSTEM_PROMPT` | L30-38 | 角色设定 + 三条铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 闲聊可自由发挥 |
-| `ChatRequest` / `ChatResponse` | L42 / L49 | 请求比 C# 多一个 `Message`（默认空串） |
-| `chat_endpoint` | L56 | `/chat` 主流程，三步：①检索 ②拼提示词 ③调 LLM |
-| 查询选择 | L62-65 | 有 `Message` 用 Message 检索；为空回退到"地点+时间+体力"场景描述 |
-| RAG 检索 | L69-72 | `retriever.ainvoke(query)` 异步召回，`page_content` 用空行拼成 context |
-| 提示词拼装 | L75-81 | 用户消息 = 游戏状态 + 【玩家的问题】+ 【参考资料】，要求"根据参考资料回答" |
-| LLM 调用 | L84-87 | SystemMessage + HumanMessage，`ainvoke` 异步，`content.strip()` 后返回（emotion 暂固定 happy） |
+| `ChatRequest` / `ChatResponse` | L42-52 / L54-56 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health） |
+| `chat_endpoint` | L61 | `/chat` 主流程，三步：①检索 ②拼提示词 ③调 LLM |
+| 查询选择 | L67-70 | 有 `Message` 用 Message 检索；为空回退到"地点+时间+体力"场景描述（**扩展字段暂未参与检索 query**） |
+| RAG 检索 | L74-77 | `retriever.ainvoke(query)` 异步召回，`page_content` 用空行拼成 context |
+| 季节/天气本地化 | L81-86 | `season_cn` 字典把 spring/summer/fall/winter 译为春季/夏季/秋季/冬季；`IsRaining` bool 译为"正在下雨/天气晴朗" |
+| 提示词拼装 | L88-100 | 结构化多行状态块（地点/季节+第N天/天气/时间/体力/270/血量/100/金币）+ 【玩家的问题】+ 【参考资料】 |
+| LLM 调用 | L103-106 | SystemMessage + HumanMessage，`ainvoke` 异步，`content.strip()` 后返回（emotion 暂固定 happy） |
 
 ### Python 端：`AIpy/src/aipy/build_knowledge_base.py`（建库脚本）
 
@@ -141,9 +142,10 @@
 - [x] Python 后端建立并端到端跑通（2026-10-04）：游戏按 F7 → 后端收到体力/时间 → HUD 显示 reply。
 - [x] 接入本地 LLM（2026-10-05）：Ollama `qwen2.5:3b` + LangChain，替换写死的模板分支。
 - [x] RAG 知识库（2026-10-07）：wiki_data（作物/鱼/礼物）→ ChromaDB + bge-m3，F7 测试问题池验证检索链路。
+- [x] 扩展状态感知第一批（2026-10-08）：C# 新增 Season/IsRaining/DayOfMonth/Money/Health 收集，Python 端 ChatRequest 同步并在提示词里做季节/天气本地化。
 - [ ] 游戏内输入框：现在 F7 只能轮流发测试问题池，还不能让玩家打字（SMAPI 中文 IME 是难点）。
 - [ ] 加防连点：思考中再按 F7 应忽略或排队，别刷一堆请求。
-- [ ] 扩充游戏状态感知：季节、天气、背包、金币、当日任务、NPC 好感等。
+- [ ] 扩展状态感知第二批：背包、当前工具、当日任务、NPC 好感等；并考虑把季节/天气拼进检索 query（目前只进 LLM 上下文）。
 - [ ] 多轮对话记忆：现在每请求都是独立的，没带历史（计划用 LangGraph）。
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
 - [ ] F7 写进 config 可改键，避免和别的 Mod 撞键。
@@ -155,7 +157,7 @@
 - Ollama 模型：对话 `qwen2.5:3b`，嵌入 `bge-m3`，两个都要先 `ollama pull`。
 - 建知识库：在 `AIpy/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
 - 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`）。
-- 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase（PlayerName/Stamina/GameTime/Location/Message）对齐 C# 序列化输出；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
+- 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 10 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
 - 编译命令：在 `ModTemplate` 目录下 `dotnet build`。
 - 只验证语法不部署：`dotnet build -p:EnableModDeploy=false -p:EnableModZip=false`。
 - DLL 输出：`d:\AI_Projects\stardewAI\ModTemplate\bin\Debug\net6.0\StardewAIAssistant.dll`。

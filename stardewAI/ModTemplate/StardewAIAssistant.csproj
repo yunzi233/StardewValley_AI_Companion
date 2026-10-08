@@ -10,5 +10,10 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Pathoschild.Stardew.ModBuildConfig" Version="4.1.0" />
+    <!-- Harmony 由 SMAPI 4 自带（smapi-internal/0Harmony.dll），只编译引用、不随 Mod 复制 -->
+    <Reference Include="0Harmony">
+      <HintPath>$(GamePath)\smapi-internal\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 </Project>

@@ -5,6 +5,8 @@
 //   using System.Net.Http;         // HttpClient / StringContent / HttpRequestException
 //   using System.Text;             // Encoding.UTF8
 //   using System.Text.Json;        // JsonSerializer / JsonException
+//   using Microsoft.Xna.Framework; // Color（聊天框消息颜色 LightSkyBlue）
+//   using HarmonyLib;              // Harmony 补丁入口（0Harmony.dll 由 SMAPI 4 自带）
 //   using StardewModdingAPI;       // Mod / IModHelper / Context
 //   using StardewModdingAPI.Events;// 各类事件参数（ButtonPressed / UpdateTicked）
 //   using StardewValley;           // Game1 / HUDMessage
@@ -16,6 +18,8 @@ using System.Collections.Generic;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using HarmonyLib;
+using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
@@ -77,12 +81,29 @@ namespace StardewAIAssistant
         /// </summary>
         private int _questionIndex = 0;
 
+        /// <summary>
+        /// 全局单例引用。
+        /// Harmony 的 Prefix 补丁方法必须是 static，没法直接拿到 Mod 实例，
+        /// 所以在 Entry 里把 this 存到这里，补丁拦截到 "AI " 消息后通过它回调实例方法。
+        /// </summary>
+        internal static ModEntry Instance { get; private set; } = null!;
+
         public override void Entry(IModHelper helper)
         {
+            // 0. 保存单例，供 Harmony 静态补丁使用
+            Instance = this;
+
+            // 0.1 安装 Harmony 补丁。
+            //     0Harmony.dll 由 SMAPI 4 自带（位于游戏目录 smapi-internal/ 下），
+            //     不需要额外安装 NuGet 包；用 Mod 的 UniqueID 作为补丁域 ID 即可。
+            //     PatchAll 会自动扫描本程序集里所有带 [HarmonyPatch] 特性的类
+            //     （本项目即 ChatBoxTextBoxEnterPatch）。
+            new Harmony(this.ModManifest.UniqueID).PatchAll();
+
             // 1. 保留原有 F7 按键监听（事件处理器用 async void 是 C# 的标准写法）
             helper.Events.Input.ButtonPressed += OnButtonPressed;
 
-            // 2. 注册每帧 Tick 事件：在游戏主线程上执行排队任务（用于安全显示 HUD）
+            // 2. 注册每帧 Tick 事件：在游戏主线程上执行排队任务（用于安全显示 HUD/聊天消息）
             helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
         }
 
@@ -120,10 +141,17 @@ namespace StardewAIAssistant
                 Stamina = Game1.player.Stamina,         // 当前体力（float 类型）
                 GameTime = Game1.timeOfDay,             // 当前游戏时间（int，如 600 表示早上 6:00）
                 Location = Game1.currentLocation.Name,  // 当前地点（如 "Farm"；如需区分同名室内建筑可改用 NameOrUniqueName）
-                Message = question                      // 【新增】本次轮到的测试问题，随 JSON 的 Message 字段一起发给后端
+                Message = question,                     // 【新增】本次轮到的测试问题，随 JSON 的 Message 字段一起发给后端
+                // ========== 【扩展状态感知】以下是新增字段 ==========
+                Season = Game1.currentSeason,           // 当前季节："spring"/"summer"/"fall"/"winter"
+                IsRaining = Game1.isRaining,            // 今天是否下雨（true/false）
+                DayOfMonth = Game1.dayOfMonth,          // 今天是当月第几天（1-28，星露谷每月只有 28 天）
+                Money = Game1.player.Money,              // 玩家当前金币（int）
+                Health = Game1.player.health             // 玩家当前血量（int）
             };
             this.Monitor.Log(
-                $"[AI伴侣] 收集状态：玩家={state.PlayerName}，体力={state.Stamina}，时间={state.GameTime}，地点={state.Location}",
+                $"[AI伴侣] 收集状态：玩家={state.PlayerName}，体力={state.Stamina}，时间={state.GameTime}，地点={state.Location}，" +
+                $"季节={state.Season}，下雨={state.IsRaining}，日期={state.DayOfMonth}号，金币={state.Money}，血量={state.Health}",
                 LogLevel.Info);
 
             // ========== 第 2 步：按下 F7 的瞬间立刻弹出“思考中”提示（零延迟反馈） ==========
@@ -239,9 +267,134 @@ namespace StardewAIAssistant
             }
         }
 
+        // ================================================================
+        // 聊天框交互（按 T 开原版聊天框，输入 "AI 问题" 回车）
+        // 入口是 Harmony 补丁 ChatBoxTextBoxEnterPatch：
+        //   玩家按回车 → 原版 ChatBox.textBoxEnter(string) 被 Prefix 拦截
+        //   → "AI " 开头则跳过原版发送逻辑，回调到本方法
+        // 注意：Prefix 运行在游戏主线程，因此本方法开头到第一个 await 之前
+        //       都在主线程上，可以安全收集游戏状态；await 之后与 F7 流程一样
+        //       靠 _mainThreadActions 队列回到主线程显示。
+        // ================================================================
+
+        /// <summary>聊天框里 AI 回复使用的文字颜色。</summary>
+        private static readonly Color ChatReplyColor = Color.LightSkyBlue;
+
+        /// <summary>聊天框里错误提示使用的文字颜色。</summary>
+        private static readonly Color ChatErrorColor = Color.OrangeRed;
+
+        /// <summary>
+        /// 处理玩家在聊天框里输入的 "AI xxx" 问题。
+        /// 由 Harmony Prefix 在游戏主线程调用，内部异步请求后端、不阻塞游戏。
+        /// </summary>
+        /// <param name="question">去掉 "AI " 前缀后的问题原文</param>
+        public async void HandleAiChatQuestion(string question)
+        {
+            // 防御性检查（与 F7 一致）：主菜单等状态下不处理
+            if (!Context.IsWorldReady || Game1.player is null || Game1.currentLocation is null)
+            {
+                EnqueueChatMessage("AI伴侣：请先进入存档后再呼叫我～", ChatErrorColor);
+                return;
+            }
+
+            // ========== 在游戏主线程收集当前游戏状态（字段与 F7 完全一致） ==========
+            GameStateData state = new()
+            {
+                PlayerName = Game1.player.Name,
+                Stamina = Game1.player.Stamina,
+                GameTime = Game1.timeOfDay,
+                Location = Game1.currentLocation.Name,
+                Message = question,                     // 本次的问题来自聊天框，而不是测试问题池
+                Season = Game1.currentSeason,
+                IsRaining = Game1.isRaining,
+                DayOfMonth = Game1.dayOfMonth,
+                Money = Game1.player.Money,
+                Health = Game1.player.health
+            };
+            this.Monitor.Log(
+                $"[AI伴侣] 聊天框提问：玩家={state.PlayerName}，体力={state.Stamina}，时间={state.GameTime}，地点={state.Location}，" +
+                $"季节={state.Season}，下雨={state.IsRaining}，日期={state.DayOfMonth}号，金币={state.Money}，血量={state.Health}\n" +
+                $"[AI伴侣] 问题内容：{question}",
+                LogLevel.Info);
+
+            // 在聊天框里给一个即时反馈（本地 3B 模型首次生成可能要等十几秒）
+            EnqueueChatMessage("AI伴侣正在思考中...", ChatReplyColor);
+
+            // ========== 异步 POST 到 Python 后端（与 F7 共用同一个 HttpClient） ==========
+            try
+            {
+                string requestJson = JsonSerializer.Serialize(state);
+                using StringContent content = new(requestJson, Encoding.UTF8, "application/json");
+
+                using HttpResponseMessage response = await HttpClient.PostAsync(BackendUrl, content);
+                response.EnsureSuccessStatusCode();
+
+                string responseJson = await response.Content.ReadAsStringAsync();
+                this.Monitor.Log($"[AI伴侣] 后端返回内容：{responseJson}", LogLevel.Debug);
+
+                ChatResponse? result = JsonSerializer.Deserialize<ChatResponse>(responseJson, JsonOptions);
+                string? reply = result?.Reply;
+
+                if (string.IsNullOrWhiteSpace(reply))
+                {
+                    EnqueueChatMessage("AI伴侣：（后端返回了空内容）", ChatErrorColor);
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(result?.Emotion))
+                    this.Monitor.Log($"[AI伴侣] 当前情绪：{result.Emotion}", LogLevel.Debug);
+
+                // 回复显示在原版聊天框里（带历史，玩家可以向上翻看）
+                EnqueueChatMessage($"AI伴侣: {reply}", ChatReplyColor);
+            }
+            catch (HttpRequestException)
+            {
+                this.Monitor.Log("[AI伴侣] 无法连接 Python 后端：http://127.0.0.1:8000", LogLevel.Error);
+                EnqueueChatMessage("AI大脑连接失败，请检查Python服务是否启动", ChatErrorColor);
+            }
+            catch (OperationCanceledException)
+            {
+                EnqueueChatMessage("AI大脑响应超时，请稍后再试", ChatErrorColor);
+            }
+            catch (JsonException ex)
+            {
+                this.Monitor.Log($"[AI伴侣] 解析后端 JSON 失败：{ex.Message}", LogLevel.Error);
+                EnqueueChatMessage("AI伴侣返回的数据格式有误", ChatErrorColor);
+            }
+            catch (Exception ex)
+            {
+                this.Monitor.Log($"[AI伴侣] 发生未知错误：{ex}", LogLevel.Error);
+                EnqueueChatMessage("AI伴侣出现未知错误，请查看 SMAPI 控制台", ChatErrorColor);
+            }
+        }
+
+        /// <summary>
+        /// 把一条聊天框消息排队到游戏主线程执行（本方法可在任意线程安全调用）。
+        /// ChatBox.addMessage 是游戏 UI 操作，必须在主线程调用，
+        /// 因此与 HUD 消息一样走 _mainThreadActions 队列。
+        /// </summary>
+        /// <param name="text">要显示的文字</param>
+        /// <param name="color">文字颜色</param>
+        private void EnqueueChatMessage(string text, Color color)
+        {
+            lock (_mainThreadActions)
+            {
+                // chatBox 在极早期（如游戏刚启动）可能还没创建，用 ?. 防空引用
+                _mainThreadActions.Enqueue(() => Game1.chatBox?.addMessage(text, color));
+            }
+        }
+
+        /// <summary>
+        /// 供 Harmony 补丁调用的聊天框消息入口（补丁是独立类，访问不到 private 方法）。
+        /// 目前用于提示 "AI" 命令用法，统一用回复色显示。
+        /// </summary>
+        internal void EnqueueChatMessageFromPatch(string text)
+            => EnqueueChatMessage(text, ChatReplyColor);
+
         /// <summary>
         /// 发送给 Python 后端的游戏状态数据结构。
-        /// 序列化后字段名为：PlayerName / Stamina / GameTime / Location / Message。
+        /// 序列化后字段名为：PlayerName / Stamina / GameTime / Location / Message /
+        /// Season / IsRaining / DayOfMonth / Money / Health。
         /// </summary>
         private sealed class GameStateData
         {
@@ -250,8 +403,24 @@ namespace StardewAIAssistant
             public int GameTime { get; set; }
             public string Location { get; set; } = string.Empty;
 
-            /// <summary>【新增】玩家本次问的问题（取自测试问题池）。</summary>
+            /// <summary>玩家本次问的问题（取自测试问题池）。</summary>
             public string Message { get; set; } = string.Empty;
+
+            // ========== 【扩展状态感知】新增字段 ==========
+            /// <summary>当前季节："spring"/"summer"/"fall"/"winter"。</summary>
+            public string Season { get; set; } = string.Empty;
+
+            /// <summary>今天是否下雨。</summary>
+            public bool IsRaining { get; set; }
+
+            /// <summary>今天是当月第几天（1-28，星露谷每月只有 28 天）。</summary>
+            public int DayOfMonth { get; set; }
+
+            /// <summary>玩家当前金币。</summary>
+            public int Money { get; set; }
+
+            /// <summary>玩家当前血量。</summary>
+            public int Health { get; set; }
         }
 
         /// <summary>

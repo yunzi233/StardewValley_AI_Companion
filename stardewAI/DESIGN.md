@@ -8,14 +8,14 @@
 ### 1. 浮动精灵（视觉存在感）
 - 进游戏后，一个像素机器人在玩家身旁漂浮
 - 跟随玩家移动，有上下浮动待机动画
-- 按 F7 呼出对话（弹出输入/显示 HUD）
+- 对话入口已打通：按 T 在原版聊天框输入 `AI 问题`（主要方式），F7 为快捷测试；未来精灵出现后对话入口不变
 - 情绪状态（reply 里的 emotion 字段）可以驱动机器人表情变化
 
 ### 2. 状态感知（知道玩家在干嘛）
-\- 已实现（随每次 F7 请求发给 Python 后端）：名字、体力、血量、游戏时间、日期（1-28）、季节、是否下雨、地点、金币
-\- 待扩展：背包、当前工具、NPC 好感度、当日任务
-\- Python 端会把季节（spring→春季）、天气（bool→正在下雨/天气晴朗）本地化成中文，再连同其他状态注入 LLM 提示词
-\- 季节/天气目前只进 LLM 上下文，尚未参与向量检索 query
+- 已实现（随每次对话请求发给 Python 后端，F7 与聊天框两个入口收集的字段一致）：名字、体力、血量、游戏时间、日期（1-28）、季节、是否下雨、地点、金币
+- 待扩展：背包、当前工具、NPC 好感度、当日任务
+- Python 端会把季节（spring→春季）、天气（bool→正在下雨/天气晴朗）本地化成中文，再连同其他状态注入 LLM 提示词
+- 季节/天气目前只进 LLM 上下文，尚未参与向量检索 query
 
 ### 3. 主动提醒（不是被动的工具）
 - 不对话时，AI 偶尔主动开口提醒
@@ -31,11 +31,14 @@
 - 存储：ChromaDB + bge-m3（本地向量模型）
 - 查询：检索 top-K 相关片段 → 塞给 LLM → LLM 基于片段回答
 
-### 5. 输入体验（待实现）
-- 目标：按 F7 弹出游戏内输入框，玩家打字 → AI 回复
-- 难点：SMAPI 默认不支持中文 IME，需要接管 Window.TextInput
-- 预计工作量：1-2 天
-- 参考：社区已有 mod 处理过（如 ChatCommands）
+### 5. 输入体验（✅ 已实现：借原版聊天框，绕开自研输入框）
+- 最终采用的方案：**不自研输入框**，直接复用星露谷 1.6 原版聊天框
+  - 玩家按 T 开框（原版行为，完全不拦截 T 键），输入 `AI 问题` 回车
+  - Harmony Prefix 补丁 `ChatBox.textBoxEnter(string)`：`AI ` 前缀的消息跳过原版发送，转给后端；其他消息（普通聊天、`/` 命令）一律放行
+  - AI 回复经主线程队列调 `chatBox.addMessage(text, Color.LightSkyBlue)` 显示在聊天框，天然带历史记录
+  - F7 保留为测试问题池入口（HUD 显示），与聊天框入口共用同一套状态收集和后端流程
+- 原计划难点（SMAPI 中文 IME、接管 Window.TextInput）因此被规避——中文输入由原版聊天框自身承担
+- 关键查证（反射 1.6.15）：输入控件是 `Game1.chatBox.chatBox`（类型 `ChatTextBox`，`Text` 在基类 `TextBox`）；回车走 `textBoxEnter(TextBox)` → 内部调 `textBoxEnter(string)` → 之后无条件 `reset()` + `clickAway()`，所以补丁只打 string 重载，清空/关框由原版自动完成
 
 ### 6. AI 神力（远期构想）
 - 玩家对话请求 AI 帮忙做农活（浇水 / 收获 / 喂动物）
@@ -44,28 +47,38 @@
 - AI 有权拒绝 / 吐槽（玩家请求过多时："您完全不想干活是吗"）
 
 ## 数据流
-玩家按 F7 / 心跳触发
+
+玩家按 T 输入 `AI 问题`（Harmony 拦截）/ 按 F7（测试问题池）
 ↓
-C# Mod 收集游戏状态 (JSON)
+C# Mod 收集游戏状态（10 个字段，JSON）
 ↓ HTTP POST
 FastAPI 后端
 ↓
-LangGraph（大脑）：
-├─ 短期记忆（本轮对话）
-├─ 长期记忆（玩家档案）【未来】
-├─ RAG 检索（Wiki 知识库）
-└─ 调 LLM 生成回复
-↓
-C# 收到 {reply, emotion} / {action: silent}
-↓
-游戏内 HUD 弹字 / 机器人气泡 / 表情变化
+RAG 检索（ChromaDB + bge-m3，top-3 片段）
+↓ 参考资料 + 结构化游戏状态 + 问题 拼提示词
+LangChain 调用 LLM（llm_factory 按 config.json 创建）：
+├─ 本地：Ollama（qwen2.5:3b，免 Key）
+└─ 云端：DeepSeek / 智谱 / 通义 / Kimi（OpenAI 兼容，BYOK）
+↓（远期：LangGraph 大脑：短期记忆 + 长期玩家档案 + 主动提醒决策）
+C# 收到 {reply, emotion}
+↓ 主线程任务队列
+聊天框消息（浅蓝色，可翻历史）/ HUD 弹字（F7）/ 未来：机器人气泡、表情变化
 
 
-## 发布时的两种模式（BYOK）
+## 发布时的两种模式（BYOK）——✅ 基础已实现
 
-- **cloud**：玩家填 DeepSeek / 智谱 / 硅基流动的 API Key
-- **local**：玩家自己装 Ollama + 拉模型
-- 配置写在 config.json，Python 后端读取后动态创建 LLM
+当前实现（`src/aipy/llm_factory.py` + `src/aipy/config.json`，模板为 `config.example.json`）：
+
+- **local（本地模式）**：`provider: "ollama"`，免 Key；玩家自己装 Ollama + 拉 `qwen2.5:3b`；`base_url` 可改（默认本机 11434）
+- **cloud（云端模式）**：`provider` 选 `deepseek` / `zhipu` / `qwen` / `kimi`，填自己的 `api_key` 和 `model`；四家 base_url 已在工厂里预设，全部走 OpenAI 兼容接口
+- 注意：无论哪种对话模式，**嵌入模型 bge-m3 始终走本地 Ollama**，所以 Ollama 仍是必装项
+- config.json 含密钥，已 gitignore；启动时读取一次，改配置需重启后端
+
+待完善：
+
+- [ ] 游戏内/启动器配置界面（当前要手动编辑 JSON）
+- [ ] temperature / top-k 等参数可配置（目前写死 0.7 / 3）
+- [ ] 配置校验与错误提示再细化（模型名写错、额度不足等）
 
 ## 当前进度
 
@@ -74,10 +87,11 @@ C# 收到 {reply, emotion} / {action: silent}
 - [x] RAG 知识库（ChromaDB + bge-m3，已收录作物 / 鱼类 / NPC 礼物）
 - [x] 状态感知（基础字段：名字 / 体力 / 时间 / 地点）
 - [x] 扩展状态感知（第一批：季节 / 是否下雨 / 日期 / 金币 / 血量，C# 收集 + Python 提示词注入）
+- [x] 游戏内自由提问（原版聊天框 + Harmony 拦截 `AI ` 前缀，回复进聊天框；F7 保留测试入口）
+- [x] BYOK 基础（config.json + LLM 工厂：ollama / deepseek / zhipu / qwen / kimi）
 - [ ] 扩展状态感知（第二批：背包 / 当前工具 / NPC 好感度 / 当日任务；季节天气参与检索 query）
 - [ ] 多轮记忆（LangGraph）
 - [ ] 浮动精灵
 - [ ] 主动提醒
-- [ ] 游戏内输入框（当前 F7 轮流发送内置测试问题池，共 5 个问题）
+- [ ] 游戏内配置界面（当前手动编辑 config.json）；模型参数 temperature/top-k 可配置
 - [ ] 设置玩家配置界面
-- [ ] BYOK 发布配置（cloud / local 双模式）

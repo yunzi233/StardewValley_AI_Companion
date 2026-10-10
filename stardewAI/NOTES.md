@@ -1,7 +1,7 @@
 # NOTES — StardewAIAssistant 开发笔记
 
 > 给自己回顾用。只记坑和要点，不抄教程。
-> 最后更新：2026-10-07
+> 最后更新：2026-10-10
 
 ## 一、踩坑清单
 
@@ -67,6 +67,32 @@
     - 现象/教训：Chroma 持久化目录的加载（含 collection 初始化）有开销，写在 `/chat` 请求里会让每次对话都白等。
     - 解决：`main.py` 顶部模块级初始化 `vectorstore` 和 `retriever`，FastAPI 启动时执行一次；请求里只调 `retriever.ainvoke(query)`。
 
+14. **SMAPI 4 的 0Harmony.dll 藏在 smapi-internal/，ModBuildConfig 不会自动引用**
+    - 现象：代码写好了 `using HarmonyLib;` 和 `[HarmonyPatch]`，编译报找不到 HarmonyLib 命名空间。
+    - 原因：SMAPI 4 把 Harmony 放在游戏目录的 `smapi-internal\0Harmony.dll`，`Pathoschild.Stardew.ModBuildConfig` 4.1.0 只自动引用 SMAPI 本身和游戏 DLL，不含 internal 目录。
+    - 解决：csproj 里显式加引用，并设 `Private=false`（运行时由 SMAPI 提供，不随 Mod 复制，避免版本冲突）：
+      `<Reference Include="0Harmony"><HintPath>$(GamePath)\smapi-internal\0Harmony.dll</HintPath><Private>false</Private></Reference>`
+
+15. **1.6 聊天框 API 和老资料对不上：字段改名、addMessage 必须带 Color**
+    - 现象：网上教程说的 `Game1.chatBox.textBox.Text` 在 1.6.15 编译不过；`addMessage("文本")` 单参数重载也不存在。
+    - 原因（反射 1.6.15 实测）：1.6 文本输入控件换成了新类 `ChatTextBox`（继承老 `TextBox`），ChatBox 里的 public 字段也叫 `chatBox`——即 `Game1.chatBox.chatBox`；`Text` 属性定义在基类 `TextBox` 上。消息方法只有 `addMessage(string, Color)`，另有 `addInfoMessage(string)` / `addErrorMessage(string)` 自动配色。
+    - 解决：读文本用 `Game1.chatBox.chatBox.Text`；显示消息用 `Game1.chatBox.addMessage(text, Color.LightSkyBlue)`。激活状态判断用 `Game1.IsChatting`（静态属性）或 `chatBox.isActive()`（小写 is）。
+
+16. **Harmony 补丁打哪个重载？先读 IL 再动手，别想当然**
+    - 现象：`ChatBox.textBoxEnter` 有两个重载（`string` 和 `TextBox sender`），不确定回车提交走哪个、补丁打几个。
+    - 查证方法：建个 net8 临时控制台项目，用 `MetadataLoadContext` 反射签名（只加载元数据，不依赖 MonoGame 运行）；再用 `PEReader` + `MetadataReader` 直接读 IL，扫 `call/callvirt` 指令看方法间调用关系。
+    - 结论：回车先触发 `textBoxEnter(TextBox sender)`，它内部调 `textBoxEnter(string text)`（真正执行命令/聊天发送），**返回后无条件调用 `reset()` + `clickAway()`**。所以 Prefix 只打 string 重载即可：拦截后返回 false 跳过发送，输入框清空和关聊天框由外层自动完成，不用自己收尾。
+
+17. **config.json 的查找路径跟着代码文件走，不跟着启动目录走**
+    - 现象：把 `config.example.json` 复制到 `AIpy/config.json`（项目根），后端照样报 `缺少配置文件`。
+    - 原因：`llm_factory.py` 里写的是 `Path(__file__).parent / "config.json"`，工厂模块在 `src/aipy/`，所以真实配置必须位于 `AIpy/src/aipy/config.json`；而 example 模板放在 `AIpy/` 根目录，复制时目标路径容易写错。
+    - 解决：`cp config.example.json src/aipy/config.json`（在 AIpy/ 下执行）。模板和真实配置不同目录这点要在 README 写醒目。
+
+18. **`uv uvicorn` 会被当成 uv 的子命令，必须 `uv run`**
+    - 现象：执行 `uv uvicorn main:app --reload` 报 `error: unrecognized subcommand 'uvicorn'`。
+    - 原因：uv 不是直接执行器，`uvicorn` 不是它的子命令；要用 `uv run` 在项目环境里执行命令。
+    - 解决：`uv run uvicorn main:app --port 8000`（`uv run python xxx.py` 同理）。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -89,7 +115,14 @@
    - 没有 `delete`：GC 自动回收；非托管资源才用 `IDisposable` / using。
    - `{ get; set; }` 是属性不是字段；`new()` 可按左边类型推断，不用写全。
    - `using` 不是 `#include`，没有头文件；`?.` 和 `??` 专门防空引用。
-   - 字符串直接 `$"x={v}"` 插值；泛型 `<T>` 运行期保留，不是 C++ 模板那套编译期展开。
+   - 字符串直接用 `$"x={v}"` 插值；泛型 `<T>` 运行期保留，不是 C++ 模板那套编译期展开。
+
+6. **Harmony Prefix 拦截模式（聊天框功能的核心套路）**
+   - `Entry` 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 一次安装；补丁类带 `[HarmonyPatch(typeof(目标类), nameof(目标类.方法), new[]{参数类型})]`，重载靠参数类型数组区分。
+   - Prefix 返回 `bool`：`true` 继续执行原方法，`false` 跳过；方法参数名与原版一致即可自动注入（如 `string text_to_send`）。
+   - Prefix 必须是 static，访问不到 Mod 实例——靠 `ModEntry.Instance` 静态单例回调实例方法。
+   - 补丁本身运行在游戏主线程；HTTP 仍异步发出，回复照旧走 `_mainThreadActions` 队列回主线程 `addMessage`。
+   - 只拦自己认识的输入（`AI ` 前缀），其余一律 `return true`——最大限度不破坏原版行为（多人聊天、`/` 命令全不受影响）。
 
 ## 三、代码地图
 
@@ -97,34 +130,55 @@
 
 | 方法/类/字段 | 位置 | 作用 |
 |---|---|---|
-| `BackendUrl` | L33 | 后端地址 `http://127.0.0.1:8000/chat` |
-| `HttpClient` | L39 | 全局复用，15 秒超时 |
-| `JsonOptions` | L49 | 小写键名大小写不敏感映射 |
-| `_mainThreadActions` | L60 | 主线程任务队列 |
-| `TestQuestions` | L65 | 测试问题池（5 个 RAG 验证问题：鱼/礼物/作物/生日/钓点） |
-| `_questionIndex` | L78 | 问题池轮转下标，取余自增 |
+| `BackendUrl` | L37 | 后端地址 `http://127.0.0.1:8000/chat` |
+| `HttpClient` | L43 | 全局复用，15 秒超时 |
+| `JsonOptions` | L53 | 小写键名大小写不敏感映射 |
+| `_mainThreadActions` | L64 | 主线程任务队列（HUD 和聊天框消息共用） |
+| `TestQuestions` | L69 | 测试问题池（5 个 RAG 验证问题：鱼/礼物/作物/生日/钓点） |
+| `_questionIndex` | L82 | 问题池轮转下标，取余自增 |
+| `Instance` | L89 | 静态单例，供 Harmony 静态补丁回调实例方法 |
 | `ModEntry`（类） | L30 | Mod 入口，继承 SMAPI 的 `Mod` |
-| `Entry` | L80 | 启动时跑一次，订阅 ButtonPressed + UpdateTicked |
-| `OnButtonPressed` | L92 | F7 主流程：取测试问题→安检→收集状态（含 Message）→弹"思考中"→异步 POST→解析→投递 HUD |
-| `OnUpdateTicked` | L199 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
-| `EnqueueHudMessage` | L227 | 把显示 HUD 的动作打包入队（可在后台线程调） |
-| `GameStateData`（内部类） | L254 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message(L261-262) + 扩展 Season/IsRaining/DayOfMonth/Money/Health(L264-278) |
-| `ChatResponse`（内部类） | L285 | 后端返回模型：Reply/Emotion |
+| `Entry` | L91 | 启动时跑一次：`Harmony.PatchAll()` + 订阅 ButtonPressed/UpdateTicked |
+| `OnButtonPressed` | L113 | F7 主流程：取测试问题→安检→收集状态（含 Message）→弹"思考中"→异步 POST→解析→投递 HUD |
+| `OnUpdateTicked` | L227 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
+| `EnqueueHudMessage` | L255 | 把显示 HUD 的动作打包入队（可在后台线程调） |
+| `HandleAiChatQuestion` | L291 | 聊天框入口：收集同样 10 字段（Message=玩家问题）→"思考中"→异步 POST→回复投递聊天框；异常分支齐全 |
+| `EnqueueChatMessage` | L378 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
+| `EnqueueChatMessageFromPatch` | L391 | internal 包装，供补丁类调用用法提示 |
+| `GameStateData`（内部类） | L399 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message + 扩展 Season/IsRaining/DayOfMonth/Money/Health |
+| `ChatResponse`（内部类） | L430 | 后端返回模型：Reply/Emotion |
+
+### C# 端：`ModTemplate/ChatBoxTextBoxEnterPatch.cs`（Harmony 补丁）
+
+| 成员 | 位置 | 作用 |
+|---|---|---|
+| `[HarmonyPatch]` 特性 | L24 | 目标 `ChatBox.textBoxEnter(string)` 重载（靠 `new[]{typeof(string)}` 区分） |
+| `AiPrefix` | L28 | 常量 `"AI "`（大写 AI + 半角空格） |
+| `Prefix` | L34 | Trim 后判断前缀：非 AI 消息 `return true` 放行；空问题回用法提示；正常问题回调 `Instance.HandleAiChatQuestion` 后 `return false` 跳过原版发送 |
 
 ### Python 端：`AIpy/main.py`（RAG 检索主逻辑）
 
 | 块 | 位置 | 作用 |
 |---|---|---|
-| 向量库初始化 | L13-23 | 模块级只跑一次：`CHROMA_DIR` → `OllamaEmbeddings(bge-m3)` → `Chroma(collection_name="stardew_wiki")` → `retriever`（k=3） |
-| `llm` | L26 | 对话模型 `ChatOllama(qwen2.5:3b, temperature=0.7)` |
-| `SYSTEM_PROMPT` | L30-38 | 角色设定 + 三条铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 闲聊可自由发挥 |
-| `ChatRequest` / `ChatResponse` | L42-52 / L54-56 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health） |
-| `chat_endpoint` | L61 | `/chat` 主流程，三步：①检索 ②拼提示词 ③调 LLM |
-| 查询选择 | L67-70 | 有 `Message` 用 Message 检索；为空回退到"地点+时间+体力"场景描述（**扩展字段暂未参与检索 query**） |
-| RAG 检索 | L74-77 | `retriever.ainvoke(query)` 异步召回，`page_content` 用空行拼成 context |
-| 季节/天气本地化 | L81-86 | `season_cn` 字典把 spring/summer/fall/winter 译为春季/夏季/秋季/冬季；`IsRaining` bool 译为"正在下雨/天气晴朗" |
-| 提示词拼装 | L88-100 | 结构化多行状态块（地点/季节+第N天/天气/时间/体力/270/血量/100/金币）+ 【玩家的问题】+ 【参考资料】 |
-| LLM 调用 | L103-106 | SystemMessage + HumanMessage，`ainvoke` 异步，`content.strip()` 后返回（emotion 暂固定 happy） |
+| 向量库初始化 | L14-25 | 模块级只跑一次：`CHROMA_DIR` → `OllamaEmbeddings(bge-m3)` → `Chroma(collection_name="stardew_wiki")` → `retriever`（k=3） |
+| LLM 创建 | L29-31 | `load_config()` 读 config.json → `create_llm()` 工厂创建；启动打印 `[LLM] provider=..., model=...` |
+| `SYSTEM_PROMPT` | L35-56 | 角色设定 + 铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 非游戏话题拒答，附正反示例 |
+| `ChatRequest` / `ChatResponse` | L60-70 / L72-74 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health） |
+| `chat_endpoint` | L78 | `/chat` 主流程，三步：①检索 ②拼提示词 ③调 LLM |
+| 查询选择 | L85-88 | 有 `Message` 用 Message 检索；为空回退到"地点+时间+体力"场景描述（**扩展字段暂未参与检索 query**） |
+| RAG 检索 | L92-95 | `retriever.ainvoke(query)` 异步召回，`page_content` 用空行拼成 context |
+| 季节/天气本地化 | L99-104 | `season_cn` 字典把 spring/summer/fall/winter 译为春季/夏季/秋季/冬季；`IsRaining` bool 译为"正在下雨/天气晴朗" |
+| 提示词拼装 | L106-118 | 结构化多行状态块（地点/季节+第N天/天气/时间/体力/270/血量/100/金币）+ 【玩家的问题】+ 【参考资料】 |
+| LLM 调用 | L121-126 | SystemMessage + HumanMessage，`ainvoke` 异步，`content.strip()` 后返回（emotion 暂固定 happy） |
+
+### Python 端：`AIpy/src/aipy/llm_factory.py`（LLM 工厂）
+
+| 块 | 位置 | 作用 |
+|---|---|---|
+| `PROVIDERS` | L9-14 | 云端厂商预设 base_url：deepseek / zhipu（智谱）/ qwen（通义）/ kimi |
+| `CONFIG_PATH` | L16 | `Path(__file__).parent/"config.json"` → 真实配置在 `src/aipy/` 下（不是项目根） |
+| `load_config` | L19-25 | config.json 不存在直接抛 FileNotFoundError 并提示复制 example |
+| `create_llm` | L28-50 | `ollama` → `ChatOllama(model, base_url)`；其他 provider 校验 api_key 非空后返回 `ChatOpenAI(model, api_key, base_url=预设)`；temperature 两边都写死 0.7 |
 
 ### Python 端：`AIpy/src/aipy/build_knowledge_base.py`（建库脚本）
 
@@ -143,21 +197,27 @@
 - [x] 接入本地 LLM（2026-10-05）：Ollama `qwen2.5:3b` + LangChain，替换写死的模板分支。
 - [x] RAG 知识库（2026-10-07）：wiki_data（作物/鱼/礼物）→ ChromaDB + bge-m3，F7 测试问题池验证检索链路。
 - [x] 扩展状态感知第一批（2026-10-08）：C# 新增 Season/IsRaining/DayOfMonth/Money/Health 收集，Python 端 ChatRequest 同步并在提示词里做季节/天气本地化。
-- [ ] 游戏内输入框：现在 F7 只能轮流发测试问题池，还不能让玩家打字（SMAPI 中文 IME 是难点）。
-- [ ] 加防连点：思考中再按 F7 应忽略或排队，别刷一堆请求。
+- [x] 原版聊天框交互（2026-10-08）：Harmony Prefix 拦截 `ChatBox.textBoxEnter(string)`，`AI ` 前缀走 AI、其他消息照原版；回复浅蓝显示在聊天框；F7 测试池保留。
+- [x] LLM 配置化 / BYOK 基础（2026-10-10）：llm_factory.py + config.json，支持 ollama/deepseek/zhipu/qwen/kimi；config.json 已 gitignore。
+- [ ] 游戏内输入框自研方案：已被"原版聊天框"方案替代，除非以后要富文本/特殊 UI，否则不再做。
+- [ ] 加防连点：思考中重复提问应忽略或排队，别刷一堆请求（F7 和聊天框两个入口都要防）。
 - [ ] 扩展状态感知第二批：背包、当前工具、当日任务、NPC 好感等；并考虑把季节/天气拼进检索 query（目前只进 LLM 上下文）。
 - [ ] 多轮对话记忆：现在每请求都是独立的，没带历史（计划用 LangGraph）。
+- [ ] 模型参数可配置：temperature（现写死 0.7）、检索 top-k（现写死 3）挪进 config.json；配置改完目前要重启后端。
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
-- [ ] F7 写进 config 可改键，避免和别的 Mod 撞键。
+- [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键。
 - [ ] emotion 现在固定 happy 只打日志，后面接表情/立绘显示。
+- [ ] main.py L10 有一行未使用的 `from langchain.chat_models import init_chat_model`，下次改动时顺手清理。
 
 ## 五、环境备忘
 
 - Python 后端目录：`D:\AI_Projects\AIpy`（与本 Mod 同一个根仓库），入口 `main.py`，FastAPI + uvicorn，uv 管理依赖，Python >=3.11。
-- Ollama 模型：对话 `qwen2.5:3b`，嵌入 `bge-m3`，两个都要先 `ollama pull`。
+- Ollama 模型：嵌入固定用 `bge-m3`（必装，RAG 向量化）；对话模型本地模式用 `qwen2.5:3b`，云端模式不需要本地对话模型，两个模型都要先 `ollama pull`。
+- LLM 配置：真实配置文件是 `AIpy/src/aipy/config.json`（⚠️ 不在项目根），模板 `AIpy/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。配置启动时读一次，改完重启后端。
 - 建知识库：在 `AIpy/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
-- 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`）。
+- 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
 - 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 10 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
+- Harmony：dll 在 `D:\Steam\steamapps\common\Stardew Valley\smapi-internal\0Harmony.dll`，csproj 显式引用 + `Private=false`；Entry 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 安装。
 - 编译命令：在 `ModTemplate` 目录下 `dotnet build`。
 - 只验证语法不部署：`dotnet build -p:EnableModDeploy=false -p:EnableModZip=false`。
 - DLL 输出：`d:\AI_Projects\stardewAI\ModTemplate\bin\Debug\net6.0\StardewAIAssistant.dll`。

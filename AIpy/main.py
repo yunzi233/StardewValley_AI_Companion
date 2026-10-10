@@ -6,6 +6,8 @@ from pydantic import BaseModel
 from langchain_chroma import Chroma
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from aipy.llm_factory import load_config, create_llm
+from langchain.chat_models import init_chat_model
 
 app = FastAPI(title="Stardew AI Companion")
 
@@ -22,8 +24,11 @@ vectorstore = Chroma(
 retriever = vectorstore.as_retriever(search_kwargs={"k": 3})   # 每次召回 3 块
 print(f"向量库加载完成")
 
-# 对话模型（保持你原来的）
-llm = ChatOllama(model="qwen2.5:3b", temperature=0.7)
+# 对话模型
+# llm = ChatOllama(model="qwen2.5:3b", temperature=0.7)
+_config = load_config()
+llm = create_llm(_config)
+print(f"[LLM] provider={_config['provider']}, model={_config['model']}")
 
 
 # ========== 系统提示词 ==========

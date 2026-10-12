@@ -1,3 +1,4 @@
+import traceback
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -6,22 +7,23 @@ from pydantic import BaseModel
 from langchain_chroma import Chroma
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from aipy.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, OLLAMA_BASE_URL, TOP_K
 from aipy.llm_factory import load_config, create_llm
 from langchain.chat_models import init_chat_model
 
 app = FastAPI(title="Stardew AI Companion")
 
 # ========== 启动时加载向量库（只做一次，不要放在请求里）==========
-CHROMA_DIR = Path(__file__).parent / "chroma_db"
-
+# 路径、模型名、集合名、检索 top-k 都从 aipy.config 统一读取，
+# 与 build_knowledge_base.py 共享同一份配置，改一处两边同时生效。
 print("正在加载向量库...")
-embeddings = OllamaEmbeddings(model="bge-m3")
+embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
 vectorstore = Chroma(
     persist_directory=str(CHROMA_DIR),
     embedding_function=embeddings,
-    collection_name="stardew_wiki",
+    collection_name=COLLECTION_NAME,
 )
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})   # 每次召回 3 块
+retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K})   # 每次召回 TOP_K 块
 print(f"向量库加载完成")
 
 # 对话模型
@@ -89,10 +91,18 @@ async def chat_endpoint(req: ChatRequest):
 
     # 以后可以让 C# 传来"玩家实际说的话"，这里先用状态代替
     # 现在先假装玩家问的是通用问题，用当前场景做 query
-    retrieved_docs = await retriever.ainvoke(query)
-    context = "\n\n".join(doc.page_content for doc in retrieved_docs)
-
-    print(f"[检索] 召回 {len(retrieved_docs)} 块")
+    try:
+        retrieved_docs = await retriever.ainvoke(query)
+        context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+        print(f"[检索] 召回 {len(retrieved_docs)} 块")
+    except Exception:
+        # 检索失败最常见原因：Ollama 服务没启动（bge-m3 嵌入走本地 Ollama）。
+        # 此时无法获取参考资料，直接返回友好错误，不让 FastAPI 抛 500 把真实异常吞掉。
+        print(f"[错误] 检索失败：\n{traceback.format_exc()}")
+        return ChatResponse(
+            reply="AI 暂时不可用：知识库检索服务（Ollama）可能没启动，请检查后重试。",
+            emotion="error",
+        )
 
     # ---- 2. 拼用户消息（含游戏状态 + 参考资料）----
     # 季节翻译
@@ -103,24 +113,33 @@ async def chat_endpoint(req: ChatRequest):
 
     weather_text = "正在下雨" if req.IsRaining else "天气晴朗"
 
-    user_msg = (
-        f"玩家{req.PlayerName}的游戏状态：\n"
-        f"- 地点：{req.Location}\n"
-        f"- 季节：{season_cn}，第 {req.DayOfMonth} 天\n"
-        f"- 天气：{weather_text}\n"
-        f"- 时间：{req.GameTime}\n"
-        f"- 体力：{req.Stamina:.0f} / 270\n"
-        f"- 血量：{req.Health} / 100\n"
-        f"- 金币：{req.Money}\n\n"
-        f"【玩家的问题】\n{req.Message}\n\n"
-        f"【参考资料】\n{context}\n\n"
-        f"请结合游戏状态和参考资料回答玩家的问题。"
-    )
+    try:
+        user_msg = (
+            f"玩家{req.PlayerName}的游戏状态：\n"
+            f"- 地点：{req.Location}\n"
+            f"- 季节：{season_cn}，第 {req.DayOfMonth} 天\n"
+            f"- 天气：{weather_text}\n"
+            f"- 时间：{req.GameTime}\n"
+            f"- 体力：{req.Stamina:.0f} / 270\n"
+            f"- 血量：{req.Health} / 100\n"
+            f"- 金币：{req.Money}\n\n"
+            f"【玩家的问题】\n{req.Message}\n\n"
+            f"【参考资料】\n{context}\n\n"
+            f"请结合游戏状态和参考资料回答玩家的问题。"
+        )
 
-    # ---- 3. 发给 LLM ----
-    response = await llm.ainvoke([
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=user_msg),
-    ])
+        # ---- 3. 发给 LLM ----
+        response = await llm.ainvoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_msg),
+        ])
 
-    return ChatResponse(reply=response.content.strip(), emotion="happy")
+        return ChatResponse(reply=response.content.strip(), emotion="happy")
+    except Exception:
+        # LLM 调用失败常见原因：API Key 无效/欠费、网络不通、本地 Ollama 没启动。
+        # 用 traceback 打完整堆栈，方便在终端日志里定位真正坏在哪一层。
+        print(f"[错误] LLM 调用失败：\n{traceback.format_exc()}")
+        return ChatResponse(
+            reply="AI 暂时不可用：模型调用失败，请检查 API Key、网络或 Ollama 服务。",
+            emotion="error",
+        )

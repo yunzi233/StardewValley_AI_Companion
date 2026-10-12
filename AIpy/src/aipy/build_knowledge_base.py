@@ -1,15 +1,13 @@
 """从 wiki_data/ 读取 Markdown 文档，切块 + 向量化，存进 chroma_db/"""
 import shutil
-from pathlib import Path
 
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 
-# 路径（脚本在 src/aipy/ 下，用 parents[2] 回到项目根目录 AIpy/）
-PROJECT_DIR = Path(__file__).resolve().parents[2]
-WIKI_DIR = PROJECT_DIR / "wiki_data"
-CHROMA_DIR = PROJECT_DIR / "chroma_db"
+# 路径、模型名、集合名都从 aipy.config 统一读取，
+# 与 main.py 共享同一份配置，改一处两边同时生效。
+from aipy.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, OLLAMA_BASE_URL, WIKI_DATA_DIR
 
 
 def main():
@@ -20,7 +18,7 @@ def main():
     )
 
     all_docs = []
-    for md_file in sorted(WIKI_DIR.glob("*.md")):
+    for md_file in sorted(WIKI_DATA_DIR.glob("*.md")):
         text = md_file.read_text(encoding="utf-8")
         chunks = splitter.split_text(text)
         for c in chunks:
@@ -34,12 +32,12 @@ def main():
     if CHROMA_DIR.exists():
         shutil.rmtree(CHROMA_DIR)
     print("\n正在向量化（用 bge-m3，第一次会比较慢）...")
-    embeddings = OllamaEmbeddings(model="bge-m3")
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
     vectorstore = Chroma.from_documents(
         documents=all_docs,
         embedding=embeddings,
         persist_directory=str(CHROMA_DIR),
-        collection_name="stardew_wiki",
+        collection_name=COLLECTION_NAME,
     )
     print(f"入库完成 → {CHROMA_DIR}")
 

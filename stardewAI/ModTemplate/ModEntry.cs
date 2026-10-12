@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Tasks;
 using HarmonyLib;
 using Microsoft.Xna.Framework;
 using StardewModdingAPI;
@@ -133,92 +134,11 @@ namespace StardewAIAssistant
             // 按下 F7 先在 HUD 里显示本次问的内容，方便调试确认轮到了哪个问题
             Game1.addHUDMessage(new HUDMessage($"玩家问：{question}"));
 
-            // ========== 第 1 步：在游戏主线程收集当前游戏状态 ==========
-            // （此方法在 await 之前的部分都运行在游戏主线程，可以安全读取游戏数据）
-            GameStateData state = new()
-            {
-                PlayerName = Game1.player.Name,          // 玩家名字
-                Stamina = Game1.player.Stamina,         // 当前体力（float 类型）
-                GameTime = Game1.timeOfDay,             // 当前游戏时间（int，如 600 表示早上 6:00）
-                Location = Game1.currentLocation.Name,  // 当前地点（如 "Farm"；如需区分同名室内建筑可改用 NameOrUniqueName）
-                Message = question,                     // 【新增】本次轮到的测试问题，随 JSON 的 Message 字段一起发给后端
-                // ========== 【扩展状态感知】以下是新增字段 ==========
-                Season = Game1.currentSeason,           // 当前季节："spring"/"summer"/"fall"/"winter"
-                IsRaining = Game1.isRaining,            // 今天是否下雨（true/false）
-                DayOfMonth = Game1.dayOfMonth,          // 今天是当月第几天（1-28，星露谷每月只有 28 天）
-                Money = Game1.player.Money,              // 玩家当前金币（int）
-                Health = Game1.player.health             // 玩家当前血量（int）
-            };
-            this.Monitor.Log(
-                $"[AI伴侣] 收集状态：玩家={state.PlayerName}，体力={state.Stamina}，时间={state.GameTime}，地点={state.Location}，" +
-                $"季节={state.Season}，下雨={state.IsRaining}，日期={state.DayOfMonth}号，金币={state.Money}，血量={state.Health}",
-                LogLevel.Info);
-
-            // ========== 第 2 步：按下 F7 的瞬间立刻弹出“思考中”提示（零延迟反馈） ==========
-            Game1.addHUDMessage(new HUDMessage("AI伴侣正在思考中..."));
-
-            // ========== 第 3 步：异步 POST 到 Python 后端（绝不卡游戏主线程） ==========
-            try
-            {
-                // 把状态对象序列化为 JSON。
-                // System.Text.Json 默认保持属性原名，因此输出：
-                // {"PlayerName":"...","Stamina":100.0,"GameTime":600,"Location":"Farm","Message":"..."}
-                string requestJson = JsonSerializer.Serialize(state);
-
-                // 构造请求体：JSON 字符串 + UTF-8 编码 + application/json 媒体类型
-                using StringContent content = new(requestJson, Encoding.UTF8, "application/json");
-
-                // await 期间游戏照常渲染、运行，玩家不会感到卡顿
-                using HttpResponseMessage response = await HttpClient.PostAsync(BackendUrl, content);
-
-                // 如果 HTTP 状态码不是 2xx（如 404 / 500），主动抛出 HttpRequestException
-                response.EnsureSuccessStatusCode();
-
-                // 读取后端返回的 JSON 文本，形如：{"reply": "xxx", "emotion": "happy"}
-                string responseJson = await response.Content.ReadAsStringAsync();
-                this.Monitor.Log($"[AI伴侣] 后端返回内容：{responseJson}", LogLevel.Debug);
-
-                // ========== 第 4 步：解析 JSON 并提取 reply 字段 ==========
-                ChatResponse? result = JsonSerializer.Deserialize<ChatResponse>(responseJson, JsonOptions);
-                string? reply = result?.Reply;
-
-                // reply 为空时给出提示，而不是显示空白消息
-                if (string.IsNullOrWhiteSpace(reply))
-                {
-                    EnqueueHudMessage("AI伴侣：（后端返回了空内容）");
-                    return;
-                }
-
-                // emotion 字段只写入 SMAPI 控制台日志（需求只要求在游戏里显示 reply）
-                if (!string.IsNullOrEmpty(result?.Emotion))
-                    this.Monitor.Log($"[AI伴侣] 当前情绪：{result.Emotion}", LogLevel.Debug);
-
-                // 回到游戏主线程显示 AI 回复
-                EnqueueHudMessage($"AI伴侣：{reply}");
-            }
-            catch (HttpRequestException)
-            {
-                // 连接不到后端：Python 没启动、端口不对、防火墙拦截等都会走到这里
-                this.Monitor.Log("[AI伴侣] 无法连接 Python 后端：http://127.0.0.1:8000", LogLevel.Error);
-                EnqueueHudMessage("AI大脑连接失败，请检查Python服务是否启动", isError: true);
-            }
-            catch (OperationCanceledException)
-            {
-                // 请求超过上面设置的 15 秒 Timeout 会抛出此异常
-                EnqueueHudMessage("AI大脑响应超时，请稍后再试", isError: true);
-            }
-            catch (JsonException ex)
-            {
-                // 后端返回的内容不是合法 JSON，或字段结构对不上
-                this.Monitor.Log($"[AI伴侣] 解析后端 JSON 失败：{ex.Message}", LogLevel.Error);
-                EnqueueHudMessage("AI伴侣返回的数据格式有误", isError: true);
-            }
-            catch (Exception ex)
-            {
-                // 兜底异常处理：任何意外错误都记录日志并提示，绝不让游戏崩溃
-                this.Monitor.Log($"[AI伴侣] 发生未知错误：{ex}", LogLevel.Error);
-                EnqueueHudMessage("AI伴侣出现未知错误，请查看 SMAPI 控制台", isError: true);
-            }
+            // 走共用核心流程：状态收集 → “思考中” → POST → 解析 → 显示回复 → 异常处理
+            // useChatBox=false 表示回复显示在 HUD（F7 入口）；
+            // 状态收集、思考中提示、POST、解析、4 个 catch 全在 SendToBackendAsync 里，
+            // 改字段/改提示/改超时只需改一处。
+            await SendToBackendAsync(question, useChatBox: false);
         }
 
         /// <summary>
@@ -284,43 +204,49 @@ namespace StardewAIAssistant
         private static readonly Color ChatErrorColor = Color.OrangeRed;
 
         /// <summary>
-        /// 处理玩家在聊天框里输入的 "AI xxx" 问题。
-        /// 由 Harmony Prefix 在游戏主线程调用，内部异步请求后端、不阻塞游戏。
+        /// 对话核心流程（F7 与聊天框两个入口共用，消除原先 95% 的重复代码）。
+        /// 涵盖：收集状态 → “思考中”提示 → 异步 POST → 解析 → 显示回复 → 4 个 catch。
+        /// 安检留在各入口里（提示方式不同：HUD vs 聊天框），本方法假定已通过安检。
         /// </summary>
-        /// <param name="question">去掉 "AI " 前缀后的问题原文</param>
-        public async void HandleAiChatQuestion(string question)
+        /// <param name="question">玩家本次的问题原文</param>
+        /// <param name="useChatBox">
+        /// true = 聊天框入口（回复/提示显示在原版聊天框，浅蓝色，可翻历史）；
+        /// false = F7 入口（回复/提示显示在 HUD）。
+        /// </param>
+        private async Task SendToBackendAsync(string question, bool useChatBox)
         {
-            // 防御性检查（与 F7 一致）：主菜单等状态下不处理
-            if (!Context.IsWorldReady || Game1.player is null || Game1.currentLocation is null)
-            {
-                EnqueueChatMessage("AI伴侣：请先进入存档后再呼叫我～", ChatErrorColor);
-                return;
-            }
-
-            // ========== 在游戏主线程收集当前游戏状态（字段与 F7 完全一致） ==========
+            // ---- 1. 在游戏主线程收集当前游戏状态（10 个字段，两个入口字段一致）----
+            // 本方法被 await 调用，调用方（F7/聊天框）在第一个 await 之前都运行在游戏主线程，
+            // 因此这里可以安全读取 Game1.player / Game1.currentLocation 等游戏对象。
             GameStateData state = new()
             {
                 PlayerName = Game1.player.Name,
                 Stamina = Game1.player.Stamina,
                 GameTime = Game1.timeOfDay,
                 Location = Game1.currentLocation.Name,
-                Message = question,                     // 本次的问题来自聊天框，而不是测试问题池
+                Message = question,                     // 本次问题（F7 来自测试池，聊天框来自玩家输入）
                 Season = Game1.currentSeason,
                 IsRaining = Game1.isRaining,
                 DayOfMonth = Game1.dayOfMonth,
                 Money = Game1.player.Money,
                 Health = Game1.player.health
             };
+
+            // 入口标记，方便在 SMAPI 日志里区分是 F7 还是聊天框触发的
+            string entryTag = useChatBox ? "聊天框" : "F7";
             this.Monitor.Log(
-                $"[AI伴侣] 聊天框提问：玩家={state.PlayerName}，体力={state.Stamina}，时间={state.GameTime}，地点={state.Location}，" +
-                $"季节={state.Season}，下雨={state.IsRaining}，日期={state.DayOfMonth}号，金币={state.Money}，血量={state.Health}\n" +
-                $"[AI伴侣] 问题内容：{question}",
+                $"[AI伴侣] [{entryTag}] 收集状态：玩家={state.PlayerName}，体力={state.Stamina}，时间={state.GameTime}，地点={state.Location}，" +
+                $"季节={state.Season}，下雨={state.IsRaining}，日期={state.DayOfMonth}号，金币={state.Money}，血量={state.Health}",
                 LogLevel.Info);
+            this.Monitor.Log($"[AI伴侣] [{entryTag}] 问题内容：{question}", LogLevel.Info);
 
-            // 在聊天框里给一个即时反馈（本地 3B 模型首次生成可能要等十几秒）
-            EnqueueChatMessage("AI伴侣正在思考中...", ChatReplyColor);
+            // ---- 2. 即时反馈“思考中”（本地 3B 模型首次生成可能要等十几秒，避免玩家以为卡了）----
+            if (useChatBox)
+                EnqueueChatMessage("AI伴侣正在思考中...", ChatReplyColor);
+            else
+                EnqueueHudMessage("AI伴侣正在思考中...");
 
-            // ========== 异步 POST 到 Python 后端（与 F7 共用同一个 HttpClient） ==========
+            // ---- 3. 异步 POST 到 Python 后端（复用全局 HttpClient，不卡游戏主线程）----
             try
             {
                 string requestJson = JsonSerializer.Serialize(state);
@@ -330,42 +256,87 @@ namespace StardewAIAssistant
                 response.EnsureSuccessStatusCode();
 
                 string responseJson = await response.Content.ReadAsStringAsync();
-                this.Monitor.Log($"[AI伴侣] 后端返回内容：{responseJson}", LogLevel.Debug);
+                this.Monitor.Log($"[AI伴侣] [{entryTag}] 后端返回内容：{responseJson}", LogLevel.Debug);
 
+                // ---- 4. 解析 JSON 并提取 reply 字段 ----
                 ChatResponse? result = JsonSerializer.Deserialize<ChatResponse>(responseJson, JsonOptions);
                 string? reply = result?.Reply;
 
+                // reply 为空时给出提示，而不是显示空白消息
                 if (string.IsNullOrWhiteSpace(reply))
                 {
-                    EnqueueChatMessage("AI伴侣：（后端返回了空内容）", ChatErrorColor);
+                    if (useChatBox)
+                        EnqueueChatMessage("AI伴侣：（后端返回了空内容）", ChatErrorColor);
+                    else
+                        EnqueueHudMessage("AI伴侣：（后端返回了空内容）");
                     return;
                 }
 
+                // emotion 字段只写入 SMAPI 控制台日志（需求只要求在游戏里显示 reply）
                 if (!string.IsNullOrEmpty(result?.Emotion))
-                    this.Monitor.Log($"[AI伴侣] 当前情绪：{result.Emotion}", LogLevel.Debug);
+                    this.Monitor.Log($"[AI伴侣] [{entryTag}] 当前情绪：{result.Emotion}", LogLevel.Debug);
 
-                // 回复显示在原版聊天框里（带历史，玩家可以向上翻看）
-                EnqueueChatMessage($"AI伴侣: {reply}", ChatReplyColor);
+                // ---- 5. 显示 AI 回复（按入口选择 HUD 或聊天框）----
+                if (useChatBox)
+                    EnqueueChatMessage($"AI伴侣：{reply}", ChatReplyColor);
+                else
+                    EnqueueHudMessage($"AI伴侣：{reply}");
             }
             catch (HttpRequestException)
             {
-                this.Monitor.Log("[AI伴侣] 无法连接 Python 后端：http://127.0.0.1:8000", LogLevel.Error);
-                EnqueueChatMessage("AI大脑连接失败，请检查Python服务是否启动", ChatErrorColor);
+                // 连接不到后端：Python 没启动、端口不对、防火墙拦截等都会走到这里
+                this.Monitor.Log($"[AI伴侣] [{entryTag}] 无法连接 Python 后端：{BackendUrl}", LogLevel.Error);
+                if (useChatBox)
+                    EnqueueChatMessage("AI大脑连接失败，请检查Python服务是否启动", ChatErrorColor);
+                else
+                    EnqueueHudMessage("AI大脑连接失败，请检查Python服务是否启动", isError: true);
             }
             catch (OperationCanceledException)
             {
-                EnqueueChatMessage("AI大脑响应超时，请稍后再试", ChatErrorColor);
+                // 请求超过 HttpClient.Timeout（15 秒）会抛出此异常
+                this.Monitor.Log($"[AI伴侣] [{entryTag}] 请求超时（>{HttpClient.Timeout.TotalSeconds:0}s）", LogLevel.Error);
+                if (useChatBox)
+                    EnqueueChatMessage("AI大脑响应超时，请稍后再试", ChatErrorColor);
+                else
+                    EnqueueHudMessage("AI大脑响应超时，请稍后再试", isError: true);
             }
             catch (JsonException ex)
             {
-                this.Monitor.Log($"[AI伴侣] 解析后端 JSON 失败：{ex.Message}", LogLevel.Error);
-                EnqueueChatMessage("AI伴侣返回的数据格式有误", ChatErrorColor);
+                // 后端返回的内容不是合法 JSON，或字段结构对不上
+                this.Monitor.Log($"[AI伴侣] [{entryTag}] 解析后端 JSON 失败：{ex.Message}", LogLevel.Error);
+                if (useChatBox)
+                    EnqueueChatMessage("AI伴侣返回的数据格式有误", ChatErrorColor);
+                else
+                    EnqueueHudMessage("AI伴侣返回的数据格式有误", isError: true);
             }
             catch (Exception ex)
             {
-                this.Monitor.Log($"[AI伴侣] 发生未知错误：{ex}", LogLevel.Error);
-                EnqueueChatMessage("AI伴侣出现未知错误，请查看 SMAPI 控制台", ChatErrorColor);
+                // 兜底异常处理：任何意外错误都记录日志并提示，绝不让游戏崩溃
+                this.Monitor.Log($"[AI伴侣] [{entryTag}] 发生未知错误：{ex}", LogLevel.Error);
+                if (useChatBox)
+                    EnqueueChatMessage("AI伴侣出现未知错误，请查看 SMAPI 控制台", ChatErrorColor);
+                else
+                    EnqueueHudMessage("AI伴侣出现未知错误，请查看 SMAPI 控制台", isError: true);
             }
+        }
+
+        /// <summary>
+        /// 聊天框入口（由 Harmony 补丁 ChatBoxTextBoxEnterPatch 在主线程调用）。
+        /// 职责仅限：安检 → 调用共用的 SendToBackendAsync（回复走聊天框通道）。
+        /// 安检留在入口里的原因：F7 和聊天框的提示方式不同（HUD vs chatBox.addMessage）。
+        /// </summary>
+        /// <param name="question">去掉 "AI " 前缀后的问题原文</param>
+        public async void HandleAiChatQuestion(string question)
+        {
+            // 防御性检查：主菜单等状态下不处理
+            if (!Context.IsWorldReady || Game1.player is null || Game1.currentLocation is null)
+            {
+                EnqueueChatMessage("AI伴侣：请先进入存档后再呼叫我～", ChatErrorColor);
+                return;
+            }
+
+            // 走共用核心流程：回复显示在原版聊天框（浅蓝色，可翻历史）
+            await SendToBackendAsync(question, useChatBox: true);
         }
 
         /// <summary>

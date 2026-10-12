@@ -124,6 +124,12 @@
    - 补丁本身运行在游戏主线程；HTTP 仍异步发出，回复照旧走 `_mainThreadActions` 队列回主线程 `addMessage`。
    - 只拦自己认识的输入（`AI ` 前缀），其余一律 `return true`——最大限度不破坏原版行为（多人聊天、`/` 命令全不受影响）。
 
+7. **LangGraph 多轮记忆的三个关键件**
+   - `State`（TypedDict）：`messages` 挂 `add_messages` reducer，节点返回的 message 自动**追加**进历史列表；其他字段（player_state/context/error）不挂 reducer，每轮**覆盖**。
+   - `MemorySaver`：`compile(checkpointer=MemorySaver())` 后，按调用时的 `config={"configurable": {"thread_id": ...}}` 存每个会话的 State 快照——我们用玩家名当 thread_id，天然按角色隔离。
+   - 请求入口只放本轮玩家原话 `messages=[HumanMessage(...)]`，历史由 Checkpointer 自动注入；**别自己把历史拼进 messages**，会重复。
+   - MemorySaver 在内存里，重启后端清空；以后换 SqliteSaver 即可落盘，接口不用改。
+
 ## 三、代码地图
 
 ### C# 端：`ModTemplate/ModEntry.cs`
@@ -158,20 +164,33 @@
 | `AiPrefix` | L28 | 常量 `"AI "`（大写 AI + 半角空格） |
 | `Prefix` | L34 | Trim 后判断前缀：非 AI 消息 `return true` 放行；空问题回用法提示；正常问题回调 `Instance.HandleAiChatQuestion` 后 `return false` 跳过原版发送 |
 
-### Python 端：`AIpy/main.py`（RAG 检索 + LLM 调用主逻辑）
+### Python 端：`AIpy/main.py`（FastAPI 入口 + LangGraph 调度）
 
 | 块 | 位置 | 作用 |
 |---|---|---|
-| 向量库初始化 | L16-27 | 模块级只跑一次：从 `aipy.config` 读 `CHROMA_DIR/COLLECTION_NAME/EMBEDDING_MODEL/OLLAMA_BASE_URL/TOP_K` → `OllamaEmbeddings` + `Chroma` → `retriever`（k=`TOP_K`） |
-| LLM 创建 | L29-33 | `load_config()` 读 config.json → `create_llm()` 工厂创建；启动打印 `[LLM] provider=..., model=...` |
-| `SYSTEM_PROMPT` | L36-58 | 角色设定 + 铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 非游戏话题拒答，附正反示例 |
-| `ChatRequest` / `ChatResponse` | L62-72 / L74-76 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health） |
-| `chat_endpoint` | L80-145 | `/chat` 主流程，三步带异常处理：①检索（try）②拼提示词③调 LLM（try） |
-| 查询选择 | L87-90 | 有 `Message` 用 Message 检索；为空回退到"地点+时间+体力"场景描述（**扩展字段暂未参与检索 query**） |
-| RAG 检索（带 try） | L94-105 | `retriever.ainvoke(query)` 异步召回；**失败返回友好错误**（`emotion="error"`）+ `traceback.format_exc()` 打完整堆栈，不再抛 500 |
-| 季节/天气本地化 | L108-114 | `season_cn` 字典把 spring/summer/fall/winter 译为春季/夏季/秋季/冬季；`IsRaining` bool 译为"正在下雨/天气晴朗" |
-| 提示词拼装 + LLM 调用（带 try） | L116-137 | 结构化多行状态块 + 【玩家的问题】+ 【参考资料】；`ainvoke` 异步，**失败返回友好错误** + traceback；成功 `emotion="happy"` |
-| 异常兜底 | L98-105 / L138-145 | 两层 catch 分别包检索和 LLM 调用，返回 `reply="AI 暂时不可用：..."` + `emotion="error"`，C# 端直接显示文本 |
+| `SYSTEM_PROMPT` | L16-38 | 角色设定 + 铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 非游戏话题拒答，附正反示例 |
+| `ChatRequest` / `ChatResponse` | L40-51 / L54-56 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health） |
+| 向量库初始化 | L58-67 | 模块级只跑一次：从 `aipy.config` 读常量 → `OllamaEmbeddings` + `Chroma` → `retriever`（k=`TOP_K`） |
+| LLM 创建 + 图构建 | L69-76 | `load_config()` → `create_llm()` 工厂创建；`init_agent()` 注入 llm/retriever/system_prompt → `graph = build_graph()` |
+| `chat_endpoint` | L79-131 | `/chat` 主流程（检索/拼提示词/调 LLM 已下沉到图节点）：①`thread_id=玩家名`（记忆按角色隔离）②组 `player_state` dict（9 字段）③`graph.ainvoke`（try 包裹，异常返回友好错误）④按 `result["error"]` 分支返回 retrieval_failed / llm_failed 提示 ⑤成功取 `messages[-1].content` 作回复 |
+
+### Python 端：`AIpy/src/aipy/agent/`（LangGraph 对话图，新增）
+
+`state.py`：
+
+| 块 | 位置 | 作用 |
+|---|---|---|
+| `State`（TypedDict） | L6-14 | `messages` 挂 `add_messages` reducer 自动累积历史；`player_state` / `context` / `error` 不挂 reducer，每轮覆盖 |
+
+`graph.py`：
+
+| 块 | 位置 | 作用 |
+|---|---|---|
+| `init_agent` | L15-20 | main.py 启动时注入 llm/retriever/system_prompt（模块级全局变量，做配置界面时再改 getter） |
+| `retrieve_node` | L23-34 | 用本轮玩家原话（`messages[-1]`）做 query 检索知识库；try 包裹，失败返回 `error="retrieval_failed"` |
+| `chat_node` | L37-71 | 季节/天气本地化 + 结构化状态块 + 【玩家的问题】+ 【参考资料】拼 user_msg；`SystemMessage + 历史 + 本轮` 调 LLM；失败返回 `error="llm_failed"` |
+| `_after_retrieve` | L74-76 | 条件边：`retrieval_failed` 直接 END 跳过 chat，否则进 chat |
+| `build_graph` | L79-87 | `StateGraph`：START → retrieve →（条件边）→ chat → END；`compile(checkpointer=MemorySaver())` 内存持久化历史 |
 
 ### Python 端：`AIpy/src/aipy/llm_factory.py`（LLM 工厂）
 
@@ -221,7 +240,8 @@
 - [ ] 游戏内输入框自研方案：已被"原版聊天框"方案替代，除非以后要富文本/特殊 UI，否则不再做。
 - [ ] 加防连点：思考中重复提问应忽略或排队，别刷一堆请求（F7 和聊天框两个入口都要防）。
 - [ ] 扩展状态感知第二批：背包、当前工具、当日任务、NPC 好感等；并考虑把季节/天气拼进检索 query（目前只进 LLM 上下文）。
-- [ ] 多轮对话记忆：现在每请求都是独立的，没带历史（计划用 LangGraph）。
+- [x] 多轮对话记忆（2026-10-12）：LangGraph 对话图（retrieve → chat）+ MemorySaver，`thread_id=玩家名` 隔离历史；检索/拼提示词/调 LLM 下沉到图节点，main.py 只剩调度。
+- [ ] 记忆持久化：MemorySaver（内存，重启清空）换 SqliteSaver 落盘；顺带考虑历史长度上限，防多轮后 token 爆炸。
 - [ ] 模型参数可配置：检索 top-k 已挪进 `aipy/config.py`（2026-10-12）；`temperature=0.7` 仍在 `llm_factory.py` 两处写死，待挪进 config.json；配置改完目前要重启后端。
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
 - [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键。
@@ -236,6 +256,7 @@
 - 建知识库：在 `AIpy/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
 - 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
 - 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 10 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
+- 多轮记忆：LangGraph `MemorySaver`（内存），`thread_id` 用玩家名隔离；重启后端即清空历史，换 SqliteSaver 可落盘（见核心机制备忘第 7 条）。
 - Harmony：dll 在 `D:\Steam\steamapps\common\Stardew Valley\smapi-internal\0Harmony.dll`，csproj 显式引用 + `Private=false`；Entry 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 安装。
 - 编译命令：在 `ModTemplate` 目录下 `dotnet build`。
 - 只验证语法不部署：`dotnet build -p:EnableModDeploy=false -p:EnableModZip=false`。

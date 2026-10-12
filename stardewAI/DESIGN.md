@@ -77,7 +77,7 @@ C# 收到 {reply, emotion}
 待完善：
 
 - [ ] 游戏内/启动器配置界面（当前要手动编辑 JSON）
-- [ ] temperature / top-k 等参数可配置（目前写死 0.7 / 3）
+- [ ] temperature / top-k 等参数可配置（top-k 已挪进 `aipy/config.py`，2026-10-12；temperature 仍写死 0.7，待挪进 config.json）
 - [ ] 配置校验与错误提示再细化（模型名写错、额度不足等）
 
 ## 当前进度
@@ -93,5 +93,5 @@ C# 收到 {reply, emotion}
 - [ ] 多轮记忆（LangGraph）
 - [ ] 浮动精灵
 - [ ] 主动提醒
-- [ ] 游戏内配置界面（当前手动编辑 config.json）；模型参数 temperature/top-k 可配置
+- [ ] 游戏内配置界面（当前手动编辑 config.json）；模型参数 temperature 可配置（top-k 已挪进 `aipy/config.py`）
 - [ ] 设置玩家配置界面

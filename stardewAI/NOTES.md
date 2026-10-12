@@ -1,7 +1,7 @@
 # NOTES — StardewAIAssistant 开发笔记
 
 > 给自己回顾用。只记坑和要点，不抄教程。
-> 最后更新：2026-10-10
+> 最后更新：2026-10-12
 
 ## 一、踩坑清单
 
@@ -130,23 +130,25 @@
 
 | 方法/类/字段 | 位置 | 作用 |
 |---|---|---|
-| `BackendUrl` | L37 | 后端地址 `http://127.0.0.1:8000/chat` |
-| `HttpClient` | L43 | 全局复用，15 秒超时 |
-| `JsonOptions` | L53 | 小写键名大小写不敏感映射 |
-| `_mainThreadActions` | L64 | 主线程任务队列（HUD 和聊天框消息共用） |
-| `TestQuestions` | L69 | 测试问题池（5 个 RAG 验证问题：鱼/礼物/作物/生日/钓点） |
-| `_questionIndex` | L82 | 问题池轮转下标，取余自增 |
-| `Instance` | L89 | 静态单例，供 Harmony 静态补丁回调实例方法 |
+| `BackendUrl` | L38 | 后端地址 `http://127.0.0.1:8000/chat` |
+| `HttpClient` | L44 | 全局复用，15 秒超时 |
+| `JsonOptions` | L54 | 小写键名大小写不敏感映射 |
+| `_mainThreadActions` | L65 | 主线程任务队列（HUD 和聊天框消息共用） |
+| `TestQuestions` | L70 | 测试问题池（5 个 RAG 验证问题：鱼/礼物/作物/生日/钓点） |
+| `_questionIndex` | L83 | 问题池轮转下标，取余自增 |
+| `Instance` | L90 | 静态单例，供 Harmony 静态补丁回调实例方法 |
 | `ModEntry`（类） | L30 | Mod 入口，继承 SMAPI 的 `Mod` |
-| `Entry` | L91 | 启动时跑一次：`Harmony.PatchAll()` + 订阅 ButtonPressed/UpdateTicked |
-| `OnButtonPressed` | L113 | F7 主流程：取测试问题→安检→收集状态（含 Message）→弹"思考中"→异步 POST→解析→投递 HUD |
-| `OnUpdateTicked` | L227 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
-| `EnqueueHudMessage` | L255 | 把显示 HUD 的动作打包入队（可在后台线程调） |
-| `HandleAiChatQuestion` | L291 | 聊天框入口：收集同样 10 字段（Message=玩家问题）→"思考中"→异步 POST→回复投递聊天框；异常分支齐全 |
-| `EnqueueChatMessage` | L378 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
-| `EnqueueChatMessageFromPatch` | L391 | internal 包装，供补丁类调用用法提示 |
-| `GameStateData`（内部类） | L399 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message + 扩展 Season/IsRaining/DayOfMonth/Money/Health |
-| `ChatResponse`（内部类） | L430 | 后端返回模型：Reply/Emotion |
+| `Entry` | L92 | 启动时跑一次：`Harmony.PatchAll()` + 订阅 ButtonPressed/UpdateTicked |
+| `OnButtonPressed` | L114 | F7 入口（精简后只管：F7 过滤→安检→取测试问题→显示"玩家问"HUD→调 `SendToBackendAsync(useChatBox:false)`） |
+| `OnUpdateTicked` | L147 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
+| `EnqueueHudMessage` | L175 | 把显示 HUD 的动作打包入队（可在后台线程调） |
+| `ChatReplyColor` / `ChatErrorColor` | L201 / L204 | 聊天框回复浅蓝 / 错误橙红的颜色常量 |
+| **`SendToBackendAsync`** | **L216** | **对话核心流程（两入口共用，消除原先 95% 重复）**：收集 10 字段状态→"思考中"→异步 POST→解析→按 `useChatBox` 分支显示→4 个 catch（HttpRequestException/OperationCanceled/Json/Exception） |
+| `HandleAiChatQuestion` | L329 | 聊天框入口（精简后只管：安检→调 `SendToBackendAsync(useChatBox:true)`） |
+| `EnqueueChatMessage` | L349 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
+| `EnqueueChatMessageFromPatch` | L362 | internal 包装，供补丁类调用用法提示 |
+| `GameStateData`（内部类） | L370 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message + 扩展 Season/IsRaining/DayOfMonth/Money/Health |
+| `ChatResponse`（内部类） | L401 | 后端返回模型：Reply/Emotion |
 
 ### C# 端：`ModTemplate/ChatBoxTextBoxEnterPatch.cs`（Harmony 补丁）
 
@@ -156,20 +158,20 @@
 | `AiPrefix` | L28 | 常量 `"AI "`（大写 AI + 半角空格） |
 | `Prefix` | L34 | Trim 后判断前缀：非 AI 消息 `return true` 放行；空问题回用法提示；正常问题回调 `Instance.HandleAiChatQuestion` 后 `return false` 跳过原版发送 |
 
-### Python 端：`AIpy/main.py`（RAG 检索主逻辑）
+### Python 端：`AIpy/main.py`（RAG 检索 + LLM 调用主逻辑）
 
 | 块 | 位置 | 作用 |
 |---|---|---|
-| 向量库初始化 | L14-25 | 模块级只跑一次：`CHROMA_DIR` → `OllamaEmbeddings(bge-m3)` → `Chroma(collection_name="stardew_wiki")` → `retriever`（k=3） |
-| LLM 创建 | L29-31 | `load_config()` 读 config.json → `create_llm()` 工厂创建；启动打印 `[LLM] provider=..., model=...` |
-| `SYSTEM_PROMPT` | L35-56 | 角色设定 + 铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 非游戏话题拒答，附正反示例 |
-| `ChatRequest` / `ChatResponse` | L60-70 / L72-74 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health） |
-| `chat_endpoint` | L78 | `/chat` 主流程，三步：①检索 ②拼提示词 ③调 LLM |
-| 查询选择 | L85-88 | 有 `Message` 用 Message 检索；为空回退到"地点+时间+体力"场景描述（**扩展字段暂未参与检索 query**） |
-| RAG 检索 | L92-95 | `retriever.ainvoke(query)` 异步召回，`page_content` 用空行拼成 context |
-| 季节/天气本地化 | L99-104 | `season_cn` 字典把 spring/summer/fall/winter 译为春季/夏季/秋季/冬季；`IsRaining` bool 译为"正在下雨/天气晴朗" |
-| 提示词拼装 | L106-118 | 结构化多行状态块（地点/季节+第N天/天气/时间/体力/270/血量/100/金币）+ 【玩家的问题】+ 【参考资料】 |
-| LLM 调用 | L121-126 | SystemMessage + HumanMessage，`ainvoke` 异步，`content.strip()` 后返回（emotion 暂固定 happy） |
+| 向量库初始化 | L16-27 | 模块级只跑一次：从 `aipy.config` 读 `CHROMA_DIR/COLLECTION_NAME/EMBEDDING_MODEL/OLLAMA_BASE_URL/TOP_K` → `OllamaEmbeddings` + `Chroma` → `retriever`（k=`TOP_K`） |
+| LLM 创建 | L29-33 | `load_config()` 读 config.json → `create_llm()` 工厂创建；启动打印 `[LLM] provider=..., model=...` |
+| `SYSTEM_PROMPT` | L36-58 | 角色设定 + 铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 非游戏话题拒答，附正反示例 |
+| `ChatRequest` / `ChatResponse` | L62-72 / L74-76 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health） |
+| `chat_endpoint` | L80-145 | `/chat` 主流程，三步带异常处理：①检索（try）②拼提示词③调 LLM（try） |
+| 查询选择 | L87-90 | 有 `Message` 用 Message 检索；为空回退到"地点+时间+体力"场景描述（**扩展字段暂未参与检索 query**） |
+| RAG 检索（带 try） | L94-105 | `retriever.ainvoke(query)` 异步召回；**失败返回友好错误**（`emotion="error"`）+ `traceback.format_exc()` 打完整堆栈，不再抛 500 |
+| 季节/天气本地化 | L108-114 | `season_cn` 字典把 spring/summer/fall/winter 译为春季/夏季/秋季/冬季；`IsRaining` bool 译为"正在下雨/天气晴朗" |
+| 提示词拼装 + LLM 调用（带 try） | L116-137 | 结构化多行状态块 + 【玩家的问题】+ 【参考资料】；`ainvoke` 异步，**失败返回友好错误** + traceback；成功 `emotion="happy"` |
+| 异常兜底 | L98-105 / L138-145 | 两层 catch 分别包检索和 LLM 调用，返回 `reply="AI 暂时不可用：..."` + `emotion="error"`，C# 端直接显示文本 |
 
 ### Python 端：`AIpy/src/aipy/llm_factory.py`（LLM 工厂）
 
@@ -180,16 +182,29 @@
 | `load_config` | L19-25 | config.json 不存在直接抛 FileNotFoundError 并提示复制 example |
 | `create_llm` | L28-50 | `ollama` → `ChatOllama(model, base_url)`；其他 provider 校验 api_key 非空后返回 `ChatOpenAI(model, api_key, base_url=预设)`；temperature 两边都写死 0.7 |
 
+### Python 端：`AIpy/src/aipy/config.py`（项目级常量，新建）
+
+集中管理原先散落在 main.py 和 build_knowledge_base.py 里的 5 处硬编码，改一处两边同时生效。
+
+| 常量 | 位置 | 作用 |
+|---|---|---|
+| `PROJECT_ROOT` | L10 | `Path(__file__).resolve().parents[2]` → `AIpy/` 根目录 |
+| `CHROMA_DIR` | L13 | `PROJECT_ROOT / "chroma_db"`，向量库持久化目录 |
+| `COLLECTION_NAME` | L14 | `"stardew_wiki"`，Chroma 集合名（main.py 和建库脚本必须一致） |
+| `EMBEDDING_MODEL` / `OLLAMA_BASE_URL` | L17-18 | `"bge-m3"` / `http://127.0.0.1:11434`，嵌入模型固定走本地 Ollama |
+| `TOP_K` | L21 | `3`，检索召回块数 |
+| `WIKI_DATA_DIR` | L24 | `PROJECT_ROOT / "wiki_data"`，知识库源 Markdown 目录 |
+
 ### Python 端：`AIpy/src/aipy/build_knowledge_base.py`（建库脚本）
 
 | 块 | 位置 | 作用 |
 |---|---|---|
-| 路径常量 | L10-12 | `parents[2]` 回到 `AIpy/` 根；输入 `wiki_data/`，输出 `chroma_db/` |
-| 切块器 | L17-20 | `MarkdownHeaderTextSplitter` 按 `##` 切，`strip_headers=False` 保留标题（保证 chunk 自包含） |
-| 读文件切块 | L23-29 | glob 所有 `*.md`，每块打 `source` metadata（来源文件名） |
-| 删旧库 | L34-35 | `shutil.rmtree` 全量重建，防重复追加 |
-| 向量化入库 | L37-43 | bge-m3 编码，`Chroma.from_documents` 持久化到 `chroma_db/` |
-| 自测 | L47-51 | 用"夏季晴天能钓到什么鱼？"查 top-2 并打印命中块，肉眼验召回质量 |
+| import config | L10 | 从 `aipy.config` 读路径/模型名/集合名（不再自己算 `parents[2]`） |
+| 切块器 | L15-18 | `MarkdownHeaderTextSplitter` 按 `##` 切，`strip_headers=False` 保留标题（保证 chunk 自包含） |
+| 读文件切块 | L20-27 | `WIKI_DATA_DIR.glob("*.md")`，每块打 `source` metadata（来源文件名） |
+| 删旧库 | L32-33 | `shutil.rmtree(CHROMA_DIR)` 全量重建，防重复追加 |
+| 向量化入库 | L34-41 | `OllamaEmbeddings(EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)` 编码，`Chroma.from_documents(collection_name=COLLECTION_NAME)` 持久化 |
+| 自测 | L44-49 | 用"夏季晴天能钓到什么鱼？"查 top-2 并打印命中块，肉眼验召回质量 |
 
 ## 四、待办 / 下一步
 
@@ -199,15 +214,19 @@
 - [x] 扩展状态感知第一批（2026-10-08）：C# 新增 Season/IsRaining/DayOfMonth/Money/Health 收集，Python 端 ChatRequest 同步并在提示词里做季节/天气本地化。
 - [x] 原版聊天框交互（2026-10-08）：Harmony Prefix 拦截 `ChatBox.textBoxEnter(string)`，`AI ` 前缀走 AI、其他消息照原版；回复浅蓝显示在聊天框；F7 测试池保留。
 - [x] LLM 配置化 / BYOK 基础（2026-10-10）：llm_factory.py + config.json，支持 ollama/deepseek/zhipu/qwen/kimi；config.json 已 gitignore。
+- [x] 代码重构：消除重复与硬编码（2026-10-12）：
+  - C# 抽 `SendToBackendAsync` 合并 F7/聊天框两入口（删 ~80 行重复，霰弹式修改消失）
+  - Python `/chat` 加两层 try-except，失败返回友好文本而非 500，traceback 打完整堆栈
+  - 新建 `aipy/config.py` 集中管理嵌入模型/集合名/检索 top-k/路径，消除 main.py 与 build_knowledge_base.py 之间的 5 处硬编码
 - [ ] 游戏内输入框自研方案：已被"原版聊天框"方案替代，除非以后要富文本/特殊 UI，否则不再做。
 - [ ] 加防连点：思考中重复提问应忽略或排队，别刷一堆请求（F7 和聊天框两个入口都要防）。
 - [ ] 扩展状态感知第二批：背包、当前工具、当日任务、NPC 好感等；并考虑把季节/天气拼进检索 query（目前只进 LLM 上下文）。
 - [ ] 多轮对话记忆：现在每请求都是独立的，没带历史（计划用 LangGraph）。
-- [ ] 模型参数可配置：temperature（现写死 0.7）、检索 top-k（现写死 3）挪进 config.json；配置改完目前要重启后端。
+- [ ] 模型参数可配置：检索 top-k 已挪进 `aipy/config.py`（2026-10-12）；`temperature=0.7` 仍在 `llm_factory.py` 两处写死，待挪进 config.json；配置改完目前要重启后端。
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
 - [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键。
-- [ ] emotion 现在固定 happy 只打日志，后面接表情/立绘显示。
-- [ ] main.py L10 有一行未使用的 `from langchain.chat_models import init_chat_model`，下次改动时顺手清理。
+- [ ] emotion 现在固定 happy 只打日志（失败时返回 error），后面接表情/立绘显示。
+- [ ] main.py L12 有一行未使用的 `from langchain.chat_models import init_chat_model`，下次改动时顺手清理。
 
 ## 五、环境备忘
 

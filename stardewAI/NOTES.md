@@ -193,9 +193,9 @@
 |---|---|---|
 | `init_agent` | L15-20 | main.py 启动时注入 llm/retriever/system_prompt（模块级全局变量，做配置界面时再改 getter） |
 | `retrieve_node` | L23-34 | 用本轮玩家原话（`messages[-1]`）做 query 检索知识库；try 包裹，失败返回 `error="retrieval_failed"` |
-| `chat_node` | L37-71 | 季节/天气本地化 + 结构化状态块 + 【玩家的问题】+ 【参考资料】拼 user_msg；`SystemMessage + 历史 + 本轮` 调 LLM；失败返回 `error="llm_failed"` |
-| `_after_retrieve` | L74-76 | 条件边：`retrieval_failed` 直接 END 跳过 chat，否则进 chat |
-| `build_graph` | L81-100 | `mkdir` 建 `data/` → `aiosqlite.connect(CHECKPOINT_DB)` 懒连接 → `AsyncSqliteSaver` → `StateGraph`：START → retrieve →（条件边）→ chat → END → `compile(checkpointer=...)`，历史落盘 SQLite |
+| `chat_node` | L39-76 | 季节/天气本地化 + 结构化状态块 + 【玩家的问题】+ 【参考资料】拼 user_msg；历史只取最近 20 条（`[-21:-1]`，约 10 轮，控 token）；`SystemMessage + 历史 + 本轮` 调 LLM；失败返回 `error="llm_failed"` |
+| `_after_retrieve` | L78-80 | 条件边：`retrieval_failed` 直接 END 跳过 chat，否则进 chat |
+| `build_graph` | L83-102 | `mkdir` 建 `data/` → `aiosqlite.connect(CHECKPOINT_DB)` 懒连接 → `AsyncSqliteSaver` → `StateGraph`：START → retrieve →（条件边）→ chat → END → `compile(checkpointer=...)`，历史落盘 SQLite |
 
 ### Python 端：`AIpy/src/aipy/llm_factory.py`（LLM 工厂）
 
@@ -248,7 +248,7 @@
 - [ ] 扩展状态感知第二批：背包、当前工具、当日任务、NPC 好感等；并考虑把季节/天气拼进检索 query（目前只进 LLM 上下文）。
 - [x] 多轮对话记忆（2026-10-12）：LangGraph 对话图（retrieve → chat）+ Checkpointer，`thread_id=玩家名` 隔离历史；检索/拼提示词/调 LLM 下沉到图节点，main.py 只剩调度。
 - [x] 记忆持久化（2026-10-13）：MemorySaver 换 AsyncSqliteSaver，历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢（同步版 SqliteSaver 不支持 async，见踩坑 19）。
-- [ ] 历史长度上限：多轮后 messages 持续增长，token 爆炸风险（云端 API 烧钱、本地小模型超上下文），需只带最近 N 轮。
+- [x] 历史长度上限（2026-10-13）：chat_node 只把最近 20 条（`[-21:-1]`，约 10 轮）塞给 LLM，更早历史仍完整留在 SQLite；token 成本可控且不丢数据。
 - [ ] 模型参数可配置：检索 top-k 已挪进 `aipy/config.py`（2026-10-12）；`temperature=0.7` 仍在 `llm_factory.py` 两处写死，待挪进 config.json；配置改完目前要重启后端。
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
 - [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键。

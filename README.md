@@ -21,21 +21,19 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 - RAG 知识库（ChromaDB + bge-m3 嵌入，已收录作物 / 鱼类 / NPC 礼物）
 - 游戏状态感知：名字 / 体力 / 血量 / 游戏时间 / 日期（1-28）/ 季节 / 是否下雨 / 地点 / 金币
 - LLM 配置化（BYOK 基础）：`config.json` 切换 provider——本地 `ollama`（免 Key）或云端 `deepseek` / `zhipu` / `qwen` / `kimi`（OpenAI 兼容接口，自带 Key）
-- 多轮对话记忆（LangGraph + SQLite 持久化）：AI 记得本次会话聊过的内容，按玩家名隔离历史，**重启后端也不丢**
+- 多轮对话记忆（LangGraph + SQLite 持久化）：AI 记得本次会话聊过的内容，按玩家名隔离历史，**重启后端也不丢**；上下文窗口只带最近 10 轮（完整历史仍存 SQLite，不丢数据）
 
 **⏳ 规划中：**
 - 浮动精灵 + 主动提醒
 - 继续扩展状态（背包 / 当前工具 / NPC 好感 / 当日任务）
 - 游戏内配置界面（当前需手动编辑 config.json）；模型参数（temperature）可配置
-- 历史长度上限：多轮后 token 持续增长，需只带最近 N 轮
 
 ## 架构
 
 ```mermaid
 flowchart LR
-    A1[按 T 打开聊天框<br/>输入 AI 问题] -->|Harmony Prefix 拦截<br/>textBoxEnter]
+    A1[按 T 打开聊天框<br/>输入 AI 问题] -->|Harmony Prefix 拦截<br/>textBoxEnter| B
     A2[按 F7 快捷测试] --> B[C# Mod<br/>ModEntry.cs]
-    A1 --> B
     B -->|状态 + Message| C[HTTP POST /chat<br/>FastAPI :8000]
     C --> G[LangGraph 对话图<br/>retrieve → chat / SQLite 记忆]
     G --> R[ChromaDB 检索<br/>bge-m3 向量 / top-3 片段]

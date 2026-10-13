@@ -59,7 +59,7 @@ LangGraph 对话图（agent/graph.py，AsyncSqliteSaver 按 thread_id=玩家名 
 └─ chat 节点：历史消息 + 参考资料 + 结构化游戏状态 + 问题 拼提示词，调 LLM
     ├─ 本地：Ollama（qwen2.5:3b，免 Key）
     └─ 云端：DeepSeek / 智谱 / 通义 / Kimi（OpenAI 兼容，BYOK）
-↓（远期：长期玩家档案 + 主动提醒决策；历史长度上限防 token 爆炸）
+↓（远期：长期玩家档案 + 主动提醒决策）
 C# 收到 {reply, emotion}
 ↓ 主线程任务队列
 聊天框消息（浅蓝色，可翻历史）/ HUD 弹字（F7）/ 未来：机器人气泡、表情变化

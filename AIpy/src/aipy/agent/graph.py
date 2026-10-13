@@ -46,8 +46,10 @@ async def chat_node(state: State):
 
     # 本轮玩家原话
     current_question = state["messages"][-1].content
-    # 之前的历史（不含本轮）
-    history = state["messages"][:-1]
+    # 之前的历史（不含本轮）——只带最近 20 条（约 10 轮对话），
+    # 更早的历史仍完整保留在 SQLite 里（不丢数据），只是不再塞给 LLM。
+    # 取舍：控制 token 成本（云端省钱 / 本地小模型不超上下文）vs 保留完整历史。
+    history = state["messages"][-21:-1]
 
     user_msg = (
         f"玩家{ps['player_name']}的游戏状态：\n"

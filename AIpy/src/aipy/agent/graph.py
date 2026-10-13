@@ -2,8 +2,10 @@
    由 main.py 在启动时注入 llm / retriever / system_prompt。"""
 import traceback
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
+import aiosqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_core.messages import SystemMessage, HumanMessage
+from aipy.config import CHECKPOINT_DB
 from .state import State
 
 # 由 init_agent 注入的依赖（保持简单，GMCM 阶段再改成 getter）
@@ -77,11 +79,22 @@ def _after_retrieve(state: State):
 
 
 def build_graph():
+    # 确保 data/ 目录存在（数据库文件不在 Git 里，换机后首次运行需自建）
+    CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+
+    # 用 AsyncSqliteSaver（同步版 SqliteSaver 不支持 async，实测会抛
+    # NotImplementedError——本图全程走 await graph.ainvoke）。
+    # aiosqlite.connect() 不 await 直接传入即可（懒连接），因此
+    # build_graph 保持同步签名，main.py 无需改动。
+    conn = aiosqlite.connect(str(CHECKPOINT_DB))
+    checkpointer = AsyncSqliteSaver(conn)
+
     builder = StateGraph(State)
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("chat", chat_node)
     builder.add_edge(START, "retrieve")
     builder.add_conditional_edges("retrieve", _after_retrieve, {"chat": "chat", END: END})
     builder.add_edge("chat", END)
-    # MemorySaver = 内存 Checkpointer，进程重启会清空（未来换 SqliteSaver 可持久化）
-    return builder.compile(checkpointer=MemorySaver())
+    # SQLite Checkpointer：对话历史按 thread_id 落盘到 data/checkpoints.db，
+    # 重启后端后历史仍在（MemorySaver 时代会清空）
+    return builder.compile(checkpointer=checkpointer)

@@ -22,3 +22,7 @@ TOP_K = 3
 
 # ---- 知识库源文件目录 ----
 WIKI_DATA_DIR = PROJECT_ROOT / "wiki_data"
+
+# ---- 对话历史持久化文件（SQLite，AsyncSqliteSaver）----
+# 放在 AIpy/data/ 下，不要混进 chroma_db/；文件本地生成，已 gitignore
+CHECKPOINT_DB = PROJECT_ROOT / "data" / "checkpoints.db"

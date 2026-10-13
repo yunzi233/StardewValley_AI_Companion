@@ -54,12 +54,12 @@ C# Mod 收集游戏状态（10 个字段，JSON）
 ↓ HTTP POST
 FastAPI 后端
 ↓
-LangGraph 对话图（agent/graph.py，MemorySaver 按 thread_id=玩家名 存对话历史）：
+LangGraph 对话图（agent/graph.py，AsyncSqliteSaver 按 thread_id=玩家名 存对话历史到 data/checkpoints.db）：
 ├─ retrieve 节点：ChromaDB + bge-m3 检索（top-3 片段），失败走条件边短路结束
 └─ chat 节点：历史消息 + 参考资料 + 结构化游戏状态 + 问题 拼提示词，调 LLM
     ├─ 本地：Ollama（qwen2.5:3b，免 Key）
     └─ 云端：DeepSeek / 智谱 / 通义 / Kimi（OpenAI 兼容，BYOK）
-↓（远期：长期玩家档案 + 主动提醒决策；记忆持久化换 SqliteSaver）
+↓（远期：长期玩家档案 + 主动提醒决策；历史长度上限防 token 爆炸）
 C# 收到 {reply, emotion}
 ↓ 主线程任务队列
 聊天框消息（浅蓝色，可翻历史）/ HUD 弹字（F7）/ 未来：机器人气泡、表情变化
@@ -90,7 +90,7 @@ C# 收到 {reply, emotion}
 - [x] 游戏内自由提问（原版聊天框 + Harmony 拦截 `AI ` 前缀，回复进聊天框；F7 保留测试入口）
 - [x] BYOK 基础（config.json + LLM 工厂：ollama / deepseek / zhipu / qwen / kimi）
 - [ ] 扩展状态感知（第二批：背包 / 当前工具 / NPC 好感度 / 当日任务；季节天气参与检索 query）
-- [x] 多轮记忆（LangGraph + MemorySaver：retrieve → chat 对话图，历史按玩家名隔离，重启清空；2026-10-12）
+- [x] 多轮记忆（LangGraph + AsyncSqliteSaver：retrieve → chat 对话图，历史按玩家名隔离并落盘 SQLite，重启不丢；2026-10-13）
 - [ ] 浮动精灵
 - [ ] 主动提醒
 - [ ] 游戏内配置界面（当前手动编辑 config.json）；模型参数 temperature 可配置（top-k 已挪进 `aipy/config.py`）

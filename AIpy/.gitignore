@@ -11,3 +11,6 @@ wheels/
 
 # 配置文件
 config.json
+
+# 对话历史数据库（LangGraph Checkpointer 本地生成）
+data/

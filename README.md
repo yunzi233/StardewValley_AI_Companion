@@ -21,13 +21,13 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 - RAG 知识库（ChromaDB + bge-m3 嵌入，已收录作物 / 鱼类 / NPC 礼物）
 - 游戏状态感知：名字 / 体力 / 血量 / 游戏时间 / 日期（1-28）/ 季节 / 是否下雨 / 地点 / 金币
 - LLM 配置化（BYOK 基础）：`config.json` 切换 provider——本地 `ollama`（免 Key）或云端 `deepseek` / `zhipu` / `qwen` / `kimi`（OpenAI 兼容接口，自带 Key）
-- 多轮对话记忆（LangGraph + MemorySaver）：AI 记得本次会话聊过的内容，按玩家名隔离历史
+- 多轮对话记忆（LangGraph + SQLite 持久化）：AI 记得本次会话聊过的内容，按玩家名隔离历史，**重启后端也不丢**
 
 **⏳ 规划中：**
 - 浮动精灵 + 主动提醒
 - 继续扩展状态（背包 / 当前工具 / NPC 好感 / 当日任务）
 - 游戏内配置界面（当前需手动编辑 config.json）；模型参数（temperature）可配置
-- 记忆持久化（当前 MemorySaver 在内存里，重启后端清空）
+- 历史长度上限：多轮后 token 持续增长，需只带最近 N 轮
 
 ## 架构
 
@@ -37,7 +37,7 @@ flowchart LR
     A2[按 F7 快捷测试] --> B[C# Mod<br/>ModEntry.cs]
     A1 --> B
     B -->|状态 + Message| C[HTTP POST /chat<br/>FastAPI :8000]
-    C --> G[LangGraph 对话图<br/>retrieve → chat / MemorySaver 记忆]
+    C --> G[LangGraph 对话图<br/>retrieve → chat / SQLite 记忆]
     G --> R[ChromaDB 检索<br/>bge-m3 向量 / top-3 片段]
     R -->|参考资料 + 历史消息| D[LangChain 拼装提示词]
     D --> F[LLM 工厂<br/>llm_factory.py 读 config.json]
@@ -55,7 +55,7 @@ flowchart LR
 - `await` 之后的代码运行在线程池后台线程，所有 UI 操作（HUD / 聊天框）通过主线程任务队列（`Queue<Action>` + `UpdateTicked`）调度回游戏主线程执行，避免随机崩溃
 - 全局复用单个 `HttpClient`，15 秒超时，请求期间游戏照常运行不卡顿
 - 向量库在后端启动时只加载一次；每次请求先做向量检索（top-3），把参考资料片段和游戏状态一起注入提示词
-- **多轮记忆**：`/chat` 请求进入 LangGraph 对话图（`retrieve → chat` 两个节点），对话历史由 `add_messages` reducer 自动累积、`MemorySaver` 按 `thread_id`（玩家名）存于内存——重启后端即清空，未来可换 SqliteSaver 落盘
+- **多轮记忆**：`/chat` 请求进入 LangGraph 对话图（`retrieve → chat` 两个节点），对话历史由 `add_messages` reducer 自动累积、`AsyncSqliteSaver` 按 `thread_id`（玩家名）落盘到 `AIpy/data/checkpoints.db`——重启后端历史不丢；删掉该文件即可清空全部记忆
 - System Prompt 严格约束：游戏知识必须依据参考资料回答，资料里没有就直说"我不太清楚"；向量检索不擅长的逻辑条件（如"晴天"误召回"雨天"鱼）交给 LLM 二次筛选
 - 未进入存档时发起对话会友好提示，不会崩溃
 
@@ -74,10 +74,11 @@ AI_Projects/
 │   ├── src/aipy/
 │   │   ├── agent/             # LangGraph 对话图（多轮记忆）
 │   │   │   ├── state.py       # 图状态：messages（自动累积历史）/ player_state / context / error
-│   │   │   └── graph.py       # retrieve → chat 两节点 + MemorySaver 记忆
+│   │   │   └── graph.py       # retrieve → chat 两节点 + AsyncSqliteSaver 记忆持久化
 │   │   ├── llm_factory.py     # LLM 工厂：读 config.json 创建本地/云端对话模型
 │   │   ├── config.json        # 【自行创建，不入库】真实配置（含 API Key）
 │   │   └── build_knowledge_base.py  # 建库脚本：wiki_data → chroma_db
+│   ├── data/                  # 对话历史 SQLite（checkpoints.db，本地生成，已 gitignore）
 │   └── chroma_db/             # 向量库（脚本本地生成，已 gitignore）
 ├── stardewAI/                 # C# SMAPI Mod
 │   ├── ModTemplate/
@@ -99,7 +100,7 @@ AI_Projects/
 
 **Python 端（AI 后端）**
 - Web：FastAPI + Uvicorn，依赖管理用 uv
-- LLM 编排：LangChain（`langchain-ollama` / `langchain-openai` / `langchain-chroma` / `langchain-text-splitters`）+ LangGraph（对话图 + MemorySaver 多轮记忆）
+- LLM 编排：LangChain（`langchain-ollama` / `langchain-openai` / `langchain-chroma` / `langchain-text-splitters`）+ LangGraph（对话图 + AsyncSqliteSaver 多轮记忆持久化）
 - LLM 供应方（config.json 切换）：本地 Ollama，或云端 OpenAI 兼容接口（DeepSeek / 智谱 GLM / 通义千问 / Kimi）
 - 向量库：ChromaDB（本地持久化，无需起数据库服务）
 - 嵌入模型：本地 Ollama `bge-m3`（知识库向量化，不随对话 provider 改变）
@@ -276,7 +277,7 @@ dotnet build
 - [ ] 漂浮机器人：贴图渲染、跟随玩家移动、待机动画
 - [ ] 防连点：思考中重复提问应忽略或排队
 - [ ] 扩充状态感知（第二批）：背包、当前工具、NPC 好感、当日任务；并让季节/天气参与检索 query
-- [x] 多轮对话记忆：LangGraph 对话图 + MemorySaver，按玩家名隔离历史（重启后端清空，未来换 SqliteSaver 持久化）
+- [x] 多轮对话记忆：LangGraph 对话图 + AsyncSqliteSaver（SQLite 落盘 `AIpy/data/checkpoints.db`），按玩家名隔离历史，重启后端不丢
 - [ ] F7 / `AI ` 前缀改为可配置，避免与其他 Mod 冲突
 - [ ] `emotion` 字段驱动机器人表情 / 立绘变化
 
@@ -287,7 +288,7 @@ dotnet build
 | 启动后端报 `缺少配置文件 .../config.json` | 还没创建配置：`cp config.example.json src/aipy/config.json` 再编辑；⚠️ 必须放在 `src/aipy/` 下（与 llm_factory.py 同目录），放项目根目录不生效 |
 | 云端模式报 401 / 认证失败 | API Key 没填、填错或欠费；检查 `src/aipy/config.json` 的 `api_key` 与 `model` 名称 |
 | 改了 config.json 没反应 | 配置只在后端**启动时读取一次**，改完必须重启 uvicorn |
-| AI 记不住几轮前说过的话 / 重启后全忘了 | 多轮记忆用 MemorySaver 存在**内存**里：重启后端即清空；历史按玩家名（thread_id）隔离，换角色或改名会各存一份。记忆持久化（SqliteSaver）在规划中 |
+| AI 回复驴唇不对马嘴 / 像串了别人的对话 | 多轮记忆按玩家名（thread_id）隔离：改了角色名 = 新会话；测试残留的旧历史会一直保留，想让 AI"失忆"就删 `AIpy/data/checkpoints.db` 后重启后端 |
 | `uv uvicorn` 报 `unrecognized subcommand` | 少了 `run`，正确命令是 `uv run uvicorn main:app --port 8000` |
 | 输入 `AI 问题` 被当成普通聊天发出去 | Harmony 补丁未生效：看 SMAPI 启动日志有无补丁加载记录；确认 `dotnet build` 后 Mods 目录 DLL 已更新 |
 | HUD 提示「AI大脑连接失败」 | Python 后端未启动或端口不是 8000，先启动后端 |

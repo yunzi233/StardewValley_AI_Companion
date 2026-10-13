@@ -1,7 +1,7 @@
 # NOTES — StardewAIAssistant 开发笔记
 
 > 给自己回顾用。只记坑和要点，不抄教程。
-> 最后更新：2026-10-12
+> 最后更新：2026-10-13
 
 ## 一、踩坑清单
 
@@ -93,6 +93,11 @@
     - 原因：uv 不是直接执行器，`uvicorn` 不是它的子命令；要用 `uv run` 在项目环境里执行命令。
     - 解决：`uv run uvicorn main:app --port 8000`（`uv run python xxx.py` 同理）。
 
+19. **同步版 `SqliteSaver` 不支持 async：直接抛 `NotImplementedError`**
+    - 现象：`build_graph` 里用 `SqliteSaver(sqlite3.connect(...))`，一调 `await graph.ainvoke` 就炸：`NotImplementedError: The SqliteSaver does not support async methods. Consider using AsyncSqliteSaver instead.`。
+    - 原因：LangGraph 的同步 Checkpointer 没实现 `aget_tuple`/`aput` 等异步方法，而我们的图全程跑在 async 里（FastAPI + `ainvoke`）。
+    - 解决：换 `AsyncSqliteSaver`（`from langgraph.checkpoint.sqlite.aio import ...`）+ `aiosqlite` 依赖。妙处：`aiosqlite.connect()` **不 await 直接传给构造函数**（懒连接）也能用，所以 `build_graph()` 保持同步签名，main.py 不用动。实测文件持久化、模拟重启历史恢复均 OK。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -126,9 +131,9 @@
 
 7. **LangGraph 多轮记忆的三个关键件**
    - `State`（TypedDict）：`messages` 挂 `add_messages` reducer，节点返回的 message 自动**追加**进历史列表；其他字段（player_state/context/error）不挂 reducer，每轮**覆盖**。
-   - `MemorySaver`：`compile(checkpointer=MemorySaver())` 后，按调用时的 `config={"configurable": {"thread_id": ...}}` 存每个会话的 State 快照——我们用玩家名当 thread_id，天然按角色隔离。
+   - Checkpointer：`compile(checkpointer=...)` 后，按调用时的 `config={"configurable": {"thread_id": ...}}` 存每个会话的 State 快照——我们用玩家名当 thread_id，天然按角色隔离。
    - 请求入口只放本轮玩家原话 `messages=[HumanMessage(...)]`，历史由 Checkpointer 自动注入；**别自己把历史拼进 messages**，会重复。
-   - MemorySaver 在内存里，重启后端清空；以后换 SqliteSaver 即可落盘，接口不用改。
+   - 持久化用 `AsyncSqliteSaver` + `aiosqlite.connect(CHECKPOINT_DB)`（懒连接），历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢；想清空记忆就删这个文件（同步版 SqliteSaver 不支持 async，见踩坑 19）。
 
 ## 三、代码地图
 
@@ -190,7 +195,7 @@
 | `retrieve_node` | L23-34 | 用本轮玩家原话（`messages[-1]`）做 query 检索知识库；try 包裹，失败返回 `error="retrieval_failed"` |
 | `chat_node` | L37-71 | 季节/天气本地化 + 结构化状态块 + 【玩家的问题】+ 【参考资料】拼 user_msg；`SystemMessage + 历史 + 本轮` 调 LLM；失败返回 `error="llm_failed"` |
 | `_after_retrieve` | L74-76 | 条件边：`retrieval_failed` 直接 END 跳过 chat，否则进 chat |
-| `build_graph` | L79-87 | `StateGraph`：START → retrieve →（条件边）→ chat → END；`compile(checkpointer=MemorySaver())` 内存持久化历史 |
+| `build_graph` | L81-100 | `mkdir` 建 `data/` → `aiosqlite.connect(CHECKPOINT_DB)` 懒连接 → `AsyncSqliteSaver` → `StateGraph`：START → retrieve →（条件边）→ chat → END → `compile(checkpointer=...)`，历史落盘 SQLite |
 
 ### Python 端：`AIpy/src/aipy/llm_factory.py`（LLM 工厂）
 
@@ -213,6 +218,7 @@
 | `EMBEDDING_MODEL` / `OLLAMA_BASE_URL` | L17-18 | `"bge-m3"` / `http://127.0.0.1:11434`，嵌入模型固定走本地 Ollama |
 | `TOP_K` | L21 | `3`，检索召回块数 |
 | `WIKI_DATA_DIR` | L24 | `PROJECT_ROOT / "wiki_data"`，知识库源 Markdown 目录 |
+| `CHECKPOINT_DB` | L28 | `PROJECT_ROOT / "data" / "checkpoints.db"`，对话历史 SQLite 文件（AsyncSqliteSaver 落盘用，已 gitignore） |
 
 ### Python 端：`AIpy/src/aipy/build_knowledge_base.py`（建库脚本）
 
@@ -240,8 +246,9 @@
 - [ ] 游戏内输入框自研方案：已被"原版聊天框"方案替代，除非以后要富文本/特殊 UI，否则不再做。
 - [ ] 加防连点：思考中重复提问应忽略或排队，别刷一堆请求（F7 和聊天框两个入口都要防）。
 - [ ] 扩展状态感知第二批：背包、当前工具、当日任务、NPC 好感等；并考虑把季节/天气拼进检索 query（目前只进 LLM 上下文）。
-- [x] 多轮对话记忆（2026-10-12）：LangGraph 对话图（retrieve → chat）+ MemorySaver，`thread_id=玩家名` 隔离历史；检索/拼提示词/调 LLM 下沉到图节点，main.py 只剩调度。
-- [ ] 记忆持久化：MemorySaver（内存，重启清空）换 SqliteSaver 落盘；顺带考虑历史长度上限，防多轮后 token 爆炸。
+- [x] 多轮对话记忆（2026-10-12）：LangGraph 对话图（retrieve → chat）+ Checkpointer，`thread_id=玩家名` 隔离历史；检索/拼提示词/调 LLM 下沉到图节点，main.py 只剩调度。
+- [x] 记忆持久化（2026-10-13）：MemorySaver 换 AsyncSqliteSaver，历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢（同步版 SqliteSaver 不支持 async，见踩坑 19）。
+- [ ] 历史长度上限：多轮后 messages 持续增长，token 爆炸风险（云端 API 烧钱、本地小模型超上下文），需只带最近 N 轮。
 - [ ] 模型参数可配置：检索 top-k 已挪进 `aipy/config.py`（2026-10-12）；`temperature=0.7` 仍在 `llm_factory.py` 两处写死，待挪进 config.json；配置改完目前要重启后端。
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
 - [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键。
@@ -256,7 +263,7 @@
 - 建知识库：在 `AIpy/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
 - 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
 - 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 10 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
-- 多轮记忆：LangGraph `MemorySaver`（内存），`thread_id` 用玩家名隔离；重启后端即清空历史，换 SqliteSaver 可落盘（见核心机制备忘第 7 条）。
+- 多轮记忆：LangGraph `AsyncSqliteSaver`（SQLite 落盘 `AIpy/data/checkpoints.db`），`thread_id` 用玩家名隔离；重启后端历史不丢，删该文件即清空（见核心机制备忘第 7 条、踩坑 19）。
 - Harmony：dll 在 `D:\Steam\steamapps\common\Stardew Valley\smapi-internal\0Harmony.dll`，csproj 显式引用 + `Private=false`；Entry 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 安装。
 - 编译命令：在 `ModTemplate` 目录下 `dotnet build`。
 - 只验证语法不部署：`dotnet build -p:EnableModDeploy=false -p:EnableModZip=false`。

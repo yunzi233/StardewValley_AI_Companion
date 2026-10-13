@@ -1,7 +1,7 @@
 # NOTES — StardewAIAssistant 开发笔记
 
 > 给自己回顾用。只记坑和要点，不抄教程。
-> 最后更新：2026-10-13
+> 最后更新：2026-10-14
 
 ## 一、踩坑清单
 
@@ -98,6 +98,11 @@
     - 原因：LangGraph 的同步 Checkpointer 没实现 `aget_tuple`/`aput` 等异步方法，而我们的图全程跑在 async 里（FastAPI + `ainvoke`）。
     - 解决：换 `AsyncSqliteSaver`（`from langgraph.checkpoint.sqlite.aio import ...`）+ `aiosqlite` 依赖。妙处：`aiosqlite.connect()` **不 await 直接传给构造函数**（懒连接）也能用，所以 `build_graph()` 保持同步签名，main.py 不用动。实测文件持久化、模拟重启历史恢复均 OK。
 
+20. **接第三方 Mod 的 API 时，必须用 shared/ 版本的接口文件**
+    - 现象：`GetApi<IGenericModConfigMenuApi>` 报 `defines method X which doesn't exist in the API`，或拿到 API 后调方法抛 `MissingMethodException`。
+    - 原因：GMCM 的 GitHub 仓库里 `framework/` 目录下的 API 文件是**内部开发版**，跟着作者进度频繁变动；而 `shared/SpaceShared.Mods/APIs/` 才是作者专门维护给**外部 Mod** 的稳定接口。用了 framework/ 版本会导致方法签名不匹配。
+    - 解决：从 GMCM 仓库的 `shared/` 路径拿 `IGenericModConfigMenuApi.cs`；下载时如果 raw.githubusercontent.com 被墙，优先走 `ghproxy.com` 镜像。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -135,6 +140,12 @@
    - 请求入口只放本轮玩家原话 `messages=[HumanMessage(...)]`，历史由 Checkpointer 自动注入；**别自己把历史拼进 messages**，会重复。
    - 持久化用 `AsyncSqliteSaver` + `aiosqlite.connect(CHECKPOINT_DB)`（懒连接），历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢；想清空记忆就删这个文件（同步版 SqliteSaver 不支持 async，见踩坑 19）。
 
+8. **Mod 间 API 调用（GMCM 集成）**
+   - 时序：Entry 执行时其他 Mod 可能还没初始化完，此时 `GetApi` 会返回 null 并触发 SMAPI 警告 `Tried to access a mod-provided API before all mods were initialized.`——必须订阅 `GameLaunched` 事件再调。
+   - 获取：`helper.ModRegistry.GetApi<IGenericModConfigMenuApi>("spacechase0.GenericModConfigMenu")`，返回 null 表示玩家没装 GMCM，跳过注册即可。
+   - 注册：`Register` + `AddTextOption` 三连；save 回调是同步 `Action`，里面要 fire-and-forget 异步推送（`_ = PushConfigToBackendAsync(...)`）。
+   - 接口文件：必须用 GMCM 仓库 `shared/` 目录下的版本，framework/ 是内部开发版（见踩坑 20）。
+
 ## 三、代码地图
 
 ### C# 端：`ModTemplate/ModEntry.cs`
@@ -149,8 +160,10 @@
 | `_questionIndex` | L83 | 问题池轮转下标，取余自增 |
 | `Instance` | L90 | 静态单例，供 Harmony 静态补丁回调实例方法 |
 | `ModEntry`（类） | L30 | Mod 入口，继承 SMAPI 的 `Mod` |
-| `Entry` | L92 | 启动时跑一次：`Harmony.PatchAll()` + 订阅 ButtonPressed/UpdateTicked |
-| `OnButtonPressed` | L114 | F7 入口（精简后只管：F7 过滤→安检→取测试问题→显示"玩家问"HUD→调 `SendToBackendAsync(useChatBox:false)`） |
+| `Entry` | L96-121 | 启动时跑一次：单例保存 → `ReadConfig<ModConfig>()` → `Harmony.PatchAll()` → 订阅 ButtonPressed/UpdateTicked/GameLaunched |
+| `OnGameLaunched` | L126-129 | GameLaunched 事件处理：调 RegisterGmcmConfig |
+| `RegisterGmcmConfig` | L136-190 | GetApi → Register + AddTextOption×3；save 回调写 JSON + fire-and-forget 推送后端；try-catch 兜底 |
+| `OnButtonPressed` | L192 | F7 入口（精简后只管：F7 过滤→安检→取测试问题→显示"玩家问"HUD→调 `SendToBackendAsync(useChatBox:false)`） |
 | `OnUpdateTicked` | L147 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
 | `EnqueueHudMessage` | L175 | 把显示 HUD 的动作打包入队（可在后台线程调） |
 | `ChatReplyColor` / `ChatErrorColor` | L201 / L204 | 聊天框回复浅蓝 / 错误橙红的颜色常量 |
@@ -158,8 +171,17 @@
 | `HandleAiChatQuestion` | L329 | 聊天框入口（精简后只管：安检→调 `SendToBackendAsync(useChatBox:true)`） |
 | `EnqueueChatMessage` | L349 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
 | `EnqueueChatMessageFromPatch` | L362 | internal 包装，供补丁类调用用法提示 |
-| `GameStateData`（内部类） | L370 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message + 扩展 Season/IsRaining/DayOfMonth/Money/Health |
-| `ChatResponse`（内部类） | L401 | 后端返回模型：Reply/Emotion |
+| `PushConfigToBackendAsync` | L370-402 | GMCM save 回调 fire-and-forget：POST /config 推送到后端；成功 HUD 提示，失败 HUD+日志 |
+| `GameStateData`（内部类） | L408 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message + 扩展 Season/IsRaining/DayOfMonth/Money/Health |
+| `ChatResponse`（内部类） | L439 | 后端返回模型：Reply/Emotion |
+
+### C# 端：`ModTemplate/ModConfig.cs`（GMCM 配置模型）
+
+| 属性 | 位置 | 作用 |
+|---|---|---|
+| `Provider` | L7 | AI 厂商：deepseek / qwen / zhipu / kimi / ollama，默认 deepseek |
+| `ApiKey` | L10 | 云端厂商 API Key；本地 Ollama 留空 |
+| `Model` | L13 | 模型名，默认 deepseek-chat |
 
 ### C# 端：`ModTemplate/ChatBoxTextBoxEnterPatch.cs`（Harmony 补丁）
 
@@ -174,10 +196,12 @@
 | 块 | 位置 | 作用 |
 |---|---|---|
 | `SYSTEM_PROMPT` | L16-38 | 角色设定 + 铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 非游戏话题拒答，附正反示例 |
-| `ChatRequest` / `ChatResponse` | L40-51 / L54-56 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health） |
-| 向量库初始化 | L58-67 | 模块级只跑一次：从 `aipy.config` 读常量 → `OllamaEmbeddings` + `Chroma` → `retriever`（k=`TOP_K`） |
-| LLM 创建 + 图构建 | L69-76 | `load_config()` → `create_llm()` 工厂创建；`init_agent()` 注入 llm/retriever/system_prompt → `graph = build_graph()` |
-| `chat_endpoint` | L79-131 | `/chat` 主流程（检索/拼提示词/调 LLM 已下沉到图节点）：①`thread_id=玩家名`（记忆按角色隔离）②组 `player_state` dict（9 字段）③`graph.ainvoke`（try 包裹，异常返回友好错误）④按 `result["error"]` 分支返回 retrieval_failed / llm_failed 提示 ⑤成功取 `messages[-1].content` 作回复 |
+| `ChatRequest` / `ChatResponse` / `ConfigRequest` | L40-51 / L54-56 / L59-62 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health）；ConfigRequest 供 GMCM 推送 |
+| `PlaceholderLLM` | L65-73 | 未配置时占位，ainvoke 返回固定提示 |
+| 向量库初始化 | L75-84 | 模块级只跑一次：从 `aipy.config` 读常量 → `OllamaEmbeddings` + `Chroma` → `retriever`（k=`TOP_K`） |
+| LLM 创建 + 图构建 | L86-99 | try-except：`load_config()` → `create_llm()` 工厂创建，失败用 PlaceholderLLM；`init_agent()` 注入 llm/retriever/system_prompt → `graph = build_graph()` |
+| `chat_endpoint` | L101-155 | `/chat` 主流程（检索/拼提示词/调 LLM 已下沉到图节点）：①`thread_id=玩家名`（记忆按角色隔离）②组 `player_state` dict（9 字段）③`graph.ainvoke`（try 包裹，异常返回友好错误）④按 `result["error"]` 分支返回 retrieval_failed / llm_failed 提示 ⑤成功取 `messages[-1].content` 作回复 |
+| `update_config` | L157-184 | `/config` 主流程：校验 provider/api_key/model → `save_config` 写文件 → `create_llm` 重建 → 重新 `init_agent`（不重建 graph，历史保留） |
 
 ### Python 端：`AIpy/src/aipy/agent/`（LangGraph 对话图，新增）
 
@@ -204,7 +228,8 @@
 | `PROVIDERS` | L9-14 | 云端厂商预设 base_url：deepseek / zhipu（智谱）/ qwen（通义）/ kimi |
 | `CONFIG_PATH` | L16 | `Path(__file__).parent/"config.json"` → 真实配置在 `src/aipy/` 下（不是项目根） |
 | `load_config` | L19-25 | config.json 不存在直接抛 FileNotFoundError 并提示复制 example |
-| `create_llm` | L28-50 | `ollama` → `ChatOllama(model, base_url)`；其他 provider 校验 api_key 非空后返回 `ChatOpenAI(model, api_key, base_url=预设)`；temperature 两边都写死 0.7 |
+| `save_config` | L28-34 | 覆盖写 config.json（UTF-8，缩进 2），供 /config 接口调用 |
+| `create_llm` | L37-59 | `ollama` → `ChatOllama(model, base_url)`；其他 provider 校验 api_key 非空后返回 `ChatOpenAI(model, api_key, base_url=预设)`；temperature 两边都写死 0.7 |
 
 ### Python 端：`AIpy/src/aipy/config.py`（项目级常量，新建）
 
@@ -249,6 +274,7 @@
 - [x] 多轮对话记忆（2026-10-12）：LangGraph 对话图（retrieve → chat）+ Checkpointer，`thread_id=玩家名` 隔离历史；检索/拼提示词/调 LLM 下沉到图节点，main.py 只剩调度。
 - [x] 记忆持久化（2026-10-13）：MemorySaver 换 AsyncSqliteSaver，历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢（同步版 SqliteSaver 不支持 async，见踩坑 19）。
 - [x] 历史长度上限（2026-10-13）：chat_node 只把最近 20 条（`[-21:-1]`，约 10 轮）塞给 LLM，更早历史仍完整留在 SQLite；token 成本可控且不丢数据。
+- [x] 游戏内配置界面（GMCM，2026-10-14）：C# 端 `ModConfig.cs` + `RegisterGmcmConfig`（GameLaunched 事件），Python 端 `POST /config` + `save_config` + `PlaceholderLLM`；配置改完无需重启后端，对话历史保留。
 - [ ] 模型参数可配置：检索 top-k 已挪进 `aipy/config.py`（2026-10-12）；`temperature=0.7` 仍在 `llm_factory.py` 两处写死，待挪进 config.json；配置改完目前要重启后端。
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
 - [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键。
@@ -259,7 +285,8 @@
 
 - Python 后端目录：`D:\AI_Projects\AIpy`（与本 Mod 同一个根仓库），入口 `main.py`，FastAPI + uvicorn，uv 管理依赖，Python >=3.11。
 - Ollama 模型：嵌入固定用 `bge-m3`（必装，RAG 向量化）；对话模型本地模式用 `qwen2.5:3b`，云端模式不需要本地对话模型，两个模型都要先 `ollama pull`。
-- LLM 配置：真实配置文件是 `AIpy/src/aipy/config.json`（⚠️ 不在项目根），模板 `AIpy/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。配置启动时读一次，改完重启后端。
+- LLM 配置：真实配置文件是 `AIpy/src/aipy/config.json`（⚠️ 不在项目根），模板 `AIpy/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启。
+- 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `AIpy/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
 - 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
 - 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 10 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。

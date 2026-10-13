@@ -15,5 +15,10 @@
       <HintPath>$(GamePath)\smapi-internal\0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- GenericModConfigMenu：由玩家自行安装，只编译引用、不随 Mod 复制 -->
+    <Reference Include="GenericModConfigMenu">
+      <HintPath>libs\GenericModConfigMenu.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 </Project>

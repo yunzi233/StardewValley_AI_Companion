@@ -30,26 +30,39 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 
 ## 架构
 
-```mermaid
-flowchart LR
-    A1[按 T 打开聊天框<br/>输入 AI 问题] -->|Harmony Prefix 拦截<br/>textBoxEnter| B
-    A2[按 F7 快捷测试] --> B[C# Mod<br/>ModEntry.cs]
-    B -->|状态 + Message| C[HTTP POST /chat<br/>FastAPI :8000]
-    C --> G[LangGraph 对话图<br/>retrieve → chat / SQLite 记忆]
-    G --> R[ChromaDB 检索<br/>bge-m3 向量 / top-3 片段]
-    R -->|参考资料 + 历史消息| D[LangChain 拼装提示词]
-    D --> F[LLM 工厂<br/>llm_factory.py 读 config.json]
-    F --> D2[本地 Ollama<br/>qwen2.5:3b]
-    F --> D3[云端 OpenAI 兼容 API<br/>DeepSeek / 智谱 / 通义 / Kimi]
-    D2 -->|reply + emotion| E[主线程任务队列]
-    D3 -->|reply + emotion| E
-    E -->|UpdateTicked| G1[聊天框消息<br/>浅蓝色 / 可翻历史]
-    E -->|UpdateTicked| G2[HUD 消息<br/>仅 F7 测试入口]
+```
+[按 T 聊天框] --Harmony 拦截--> [C# Mod (ModEntry.cs)]
+[按 F7 测试]  -----------------> [C# Mod (ModEntry.cs)]
+                                      |
+                                      v HTTP POST /chat
+                              [FastAPI :8000]
+                                      |
+                                      v
+                         [LangGraph 对话图: retrieve -> chat]
+                                      |
+                                      v
+                    [ChromaDB 检索 (bge-m3, top-3)]
+                                      |
+                                      v 参考资料 + 历史消息
+                              [LangChain 拼提示词]
+                                      |
+                                      v
+                         [LLM 工厂: llm_factory.py]
+                          /                      \
+                         v                        v
+              [本地 Ollama qwen2.5:3b]   [云端 OpenAI 兼容 API]
+                         \                      /
+                          v                    v
+                         [主线程任务队列]
+                          /              \
+                         v                v
+              [聊天框消息(浅蓝)]    [HUD 消息(仅 F7)]
 ```
 
 **关键设计**：
 - **双入口复用同一套后端流程**：聊天框提问经 Harmony 补丁（`ChatBox.textBoxEnter(string)` 的 Prefix）截获，`"AI "` 前缀才拦截，其他消息原样放行；F7 测试问题池逻辑独立保留
 - **LLM 工厂模式**：[llm_factory.py](AIpy/src/aipy/llm_factory.py) 启动时读 `config.json`，按 `provider` 创建 `ChatOllama` 或 `ChatOpenAI`（四个云端厂商的 base_url 已内置预设）；嵌入模型始终用本地 Ollama 的 bge-m3，与对话模型选型无关
+- **游戏内配置（GMCM）**：玩家 ESC → Mod 选项 → 填厂商/Key/模型 → 保存时 C# 推送到后端 `POST /config` → 写 `config.json` + 重建 LLM 注入对话图，无需重启；后端未启动时配置只存本地 ModConfig.json，启动后需重新保存
 - `await` 之后的代码运行在线程池后台线程，所有 UI 操作（HUD / 聊天框）通过主线程任务队列（`Queue<Action>` + `UpdateTicked`）调度回游戏主线程执行，避免随机崩溃
 - 全局复用单个 `HttpClient`，15 秒超时，请求期间游戏照常运行不卡顿
 - 向量库在后端启动时只加载一次；每次请求先做向量检索（top-3），把参考资料片段和游戏状态一起注入提示词
@@ -62,7 +75,7 @@ flowchart LR
 ```
 AI_Projects/
 ├── AIpy/                      # Python AI 后端
-│   ├── main.py                # 入口：FastAPI + LangGraph 对话图调度，POST /chat
+│   ├── main.py                # 入口：FastAPI + LangGraph 对话图调度，POST /chat + POST /config
 │   ├── config.example.json    # LLM 配置模板（随仓库分发，真实 config.json 已 gitignore）
 │   ├── pyproject.toml         # uv 依赖管理
 │   ├── wiki_data/             # 知识库源文件（Markdown，随仓库分发）
@@ -73,15 +86,16 @@ AI_Projects/
 │   │   ├── agent/             # LangGraph 对话图（多轮记忆）
 │   │   │   ├── state.py       # 图状态：messages（自动累积历史）/ player_state / context / error
 │   │   │   └── graph.py       # retrieve → chat 两节点 + AsyncSqliteSaver 记忆持久化
-│   │   ├── llm_factory.py     # LLM 工厂：读 config.json 创建本地/云端对话模型
+│   │   ├── llm_factory.py     # LLM 工厂：读/写 config.json 创建本地/云端对话模型
 │   │   ├── config.json        # 【自行创建，不入库】真实配置（含 API Key）
 │   │   └── build_knowledge_base.py  # 建库脚本：wiki_data → chroma_db
 │   ├── data/                  # 对话历史 SQLite（checkpoints.db，本地生成，已 gitignore）
 │   └── chroma_db/             # 向量库（脚本本地生成，已 gitignore）
 ├── stardewAI/                 # C# SMAPI Mod
 │   ├── ModTemplate/
-│   │   ├── ModEntry.cs        # Mod 入口：F7/聊天框两条对话流程、线程队列、HTTP 请求
+│   │   ├── ModEntry.cs        # Mod 入口：F7/聊天框两条对话流程、GMCM 配置、线程队列、HTTP 请求
 │   │   ├── ChatBoxTextBoxEnterPatch.cs  # Harmony 补丁：拦截聊天框 "AI " 消息
+│   │   ├── ModConfig.cs       # GMCM 配置模型：Provider / ApiKey / Model
 │   │   ├── manifest.json      # SMAPI 清单（UniqueID: yz.StardewAIAssistant）
 │   │   └── StardewAIAssistant.csproj
 │   ├── DESIGN.md              # 设计蓝图（模块规划与数据流）
@@ -95,6 +109,7 @@ AI_Projects/
 - .NET 6 / C#、SMAPI 4.x、`System.Net.Http.HttpClient` + `System.Text.Json`
 - NuGet：`Pathoschild.Stardew.ModBuildConfig` 4.1.0
 - Harmony（SMAPI 4 自带的 `0Harmony.dll`）：Prefix 补丁拦截原版聊天框提交
+- GenericModConfigMenu（可选，玩家自行安装）：游戏内配置界面，保存时推送到后端
 
 **Python 端（AI 后端）**
 - Web：FastAPI + Uvicorn，依赖管理用 uv
@@ -150,7 +165,19 @@ uv run python src/aipy/build_knowledge_base.py
 > - 首次向量化较慢（bge-m3 要逐个 chunk 编码），属正常现象
 > - `chroma_db/` 是本地生成物，**不随仓库分发**（已加入 `.gitignore`），换机器或重新克隆后必须重新建库，否则后端启动/检索会报错
 
-### 3. 配置对话模型（首次必做）
+### 3. 配置对话模型
+
+**方式一（推荐）：游戏内 GMCM 配置**
+1. 安装 [GenericModConfigMenu](https://www.nexusmods.com/stardewvalley/mods/5098)（可选，但推荐）
+2. 启动游戏 → ESC → 选项 → 往下找到 "Mod 选项" → Stardew AI Assistant
+3. 填三项：
+   - **AI 厂商**：`deepseek` / `qwen` / `zhipu` / `kimi` / `ollama`
+   - **API Key**：云端必填，本地 Ollama 留空
+   - **模型名**：如 `deepseek-chat` / `qwen-plus` / `glm-4-flash` / `qwen2.5:3b`
+4. 保存 → C# 自动推送到后端 `POST /config` → 写 `config.json` + 重建 LLM，**无需重启后端**
+5. 后端未启动时保存：配置只写本地 `ModConfig.json`，HUD 提示"后端未启动，配置已保存到本地；启动后端后请重新保存"
+
+**方式二：手动编辑配置文件（无 GMCM 时）**
 
 后端启动时从 **`src/aipy/config.json`** 读取对话模型配置。仓库只提供模板 [config.example.json](AIpy/config.example.json)，真实配置含 API Key，已加入 `.gitignore` 不会被提交。
 
@@ -185,7 +212,7 @@ cp config.example.json src/aipy/config.json
 
 - `provider` 可选：`ollama` / `deepseek` / `zhipu` / `qwen` / `kimi`，云端四家的接口地址已在 [llm_factory.py](AIpy/src/aipy/llm_factory.py) 内置预设，不用自己填 base_url
 - 各家模型名填对应官方文档的型号（如智谱 `glm-4-flash`、通义 `qwen-plus`、Kimi `moonshot-v1-8k`）
-- 缺少 config.json 或云端模式没填 Key，后端会在启动时直接报错并给出提示
+- 缺少 config.json 或云端模式没填 Key：后端**仍能启动**（用 PlaceholderLLM 占位，回复提示"请先在游戏里配置"），收到 GMCM 推送后自动切换为真实模型
 
 ### 4. 启动 AI 后端
 
@@ -220,6 +247,8 @@ dotnet build
 4. SMAPI 控制台与后端终端可查看状态收集、检索命中块数与返回内容
 
 ## 通信协议（C# ⇄ Python）
+
+### POST /chat（对话）
 
 `POST http://127.0.0.1:8000/chat`
 
@@ -259,9 +288,24 @@ dotnet build
 { "reply": "你好呀 农夫！...", "emotion": "happy" }
 ```
 
+### POST /config（GMCM 推送配置）
+
+`POST http://127.0.0.1:8000/config`
+
+**请求**（snake_case，与后端 config.json 对齐）：
+
+```json
+{ "provider": "deepseek", "api_key": "sk-xxx", "model": "deepseek-chat" }
+```
+
+- `provider` 白名单：`ollama` / `deepseek` / `zhipu` / `qwen` / `kimi`，其他值返回 400
+- `provider != ollama` 时 `api_key` 必填，`model` 必填；校验失败返回 400 + 错误详情
+- 成功：写 `src/aipy/config.json` → 重建 LLM → 重新注入对话图，返回 `{"status": "ok"}`；**对话历史（SQLite）保留，不重建 graph**
+- C# 端 GMCM 保存时自动推送；后端未启动时 C# 只写本地 `ModConfig.json`
+
 注意事项：
-- `GameTime` 为游戏内时间，`600` 表示早上 6:00
-- 请求字段名是**故意**用 PascalCase 对齐 C# 输出的，修改字段时两端必须同步修改
+- `/chat` 的 `GameTime` 为游戏内时间，`600` 表示早上 6:00
+- `/chat` 请求字段名是**故意**用 PascalCase 对齐 C# 输出的，修改字段时两端必须同步修改
 
 ## Roadmap
 
@@ -270,8 +314,8 @@ dotnet build
 - [x] 扩充状态感知（第一批）：季节、天气、日期、金币、血量（C# 收集 + Python 注入提示词）
 - [x] 游戏内自由提问：借原版聊天框实现（按 T → `AI 问题` → Harmony 拦截），绕开了自研输入框的中文 IME 难题；回复进聊天框可翻历史
 - [x] LLM provider / 模型可配置：`config.json` + LLM 工厂，支持 ollama / deepseek / zhipu / qwen / kimi（BYOK 基础）
+- [x] 游戏内配置界面（GMCM，2026-10-14）：ESC → Mod 选项 → 填厂商/Key/模型 → 保存推送后端 `POST /config`，写文件 + 重建 LLM，无需重启；无 GMCM 时可手动编辑 `src/aipy/config.json`
 - [ ] 模型参数可配置化（`temperature=0.7` 仍写死；检索 top-k 已挪进 `aipy/config.py`）
-- [ ] 游戏内配置界面（当前需手动编辑 `src/aipy/config.json`，改完重启后端生效）
 - [ ] 漂浮机器人：贴图渲染、跟随玩家移动、待机动画
 - [ ] 防连点：思考中重复提问应忽略或排队
 - [ ] 扩充状态感知（第二批）：背包、当前工具、NPC 好感、当日任务；并让季节/天气参与检索 query
@@ -283,8 +327,8 @@ dotnet build
 
 | 现象 | 原因与解决 |
 |---|---|
-| 启动后端报 `缺少配置文件 .../config.json` | 还没创建配置：`cp config.example.json src/aipy/config.json` 再编辑；⚠️ 必须放在 `src/aipy/` 下（与 llm_factory.py 同目录），放项目根目录不生效 |
-| 云端模式报 401 / 认证失败 | API Key 没填、填错或欠费；检查 `src/aipy/config.json` 的 `api_key` 与 `model` 名称 |
+| 启动后端报 `缺少配置文件 .../config.json` | 还没创建配置：`cp config.example.json src/aipy/config.json` 再编辑；⚠️ 必须放在 `src/aipy/` 下（与 llm_factory.py 同目录），放项目根目录不生效；**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位，回复提示去游戏里配置） |
+| 云端模式报 401 / 认证失败 | API Key 没填、填错或欠费；检查 `src/aipy/config.json` 的 `api_key` 与 `model` 名称；或检查 GMCM 里填的 Key 是否含空格 |
 | 改了 config.json 没反应 | 配置只在后端**启动时读取一次**，改完必须重启 uvicorn |
 | AI 回复驴唇不对马嘴 / 像串了别人的对话 | 多轮记忆按玩家名（thread_id）隔离：改了角色名 = 新会话；测试残留的旧历史会一直保留，想让 AI"失忆"就删 `AIpy/data/checkpoints.db` 后重启后端 |
 | `uv uvicorn` 报 `unrecognized subcommand` | 少了 `run`，正确命令是 `uv run uvicorn main:app --port 8000` |

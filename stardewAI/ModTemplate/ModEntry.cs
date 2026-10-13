@@ -21,6 +21,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using HarmonyLib;
 using Microsoft.Xna.Framework;
+using GenericModConfigMenu;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
@@ -89,12 +90,18 @@ namespace StardewAIAssistant
         /// </summary>
         internal static ModEntry Instance { get; private set; } = null!;
 
+        /// <summary>玩家通过 GMCM 或 ModConfig.json 配置的 AI 厂商参数。</summary>
+        private ModConfig _config = null!;
+
         public override void Entry(IModHelper helper)
         {
             // 0. 保存单例，供 Harmony 静态补丁使用
             Instance = this;
 
-            // 0.1 安装 Harmony 补丁。
+            // 0.1 读取本地配置（SMAPI 会自动生成 ModConfig.json，首次启动用默认值）
+            _config = helper.ReadConfig<ModConfig>();
+
+            // 0.2 安装 Harmony 补丁。
             //     0Harmony.dll 由 SMAPI 4 自带（位于游戏目录 smapi-internal/ 下），
             //     不需要额外安装 NuGet 包；用 Mod 的 UniqueID 作为补丁域 ID 即可。
             //     PatchAll 会自动扫描本程序集里所有带 [HarmonyPatch] 特性的类
@@ -106,6 +113,80 @@ namespace StardewAIAssistant
 
             // 2. 注册每帧 Tick 事件：在游戏主线程上执行排队任务（用于安全显示 HUD/聊天消息）
             helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
+
+            // 3. 订阅 GameLaunched 事件：等所有 Mod 初始化完后再调 GMCM 的 API
+            //    原因：Entry 执行时其他 Mod 可能还没加载完，此时 GetApi 会返回 null
+            //    并触发 SMAPI 警告 "Tried to access a mod-provided API before all mods were initialized."
+            helper.Events.GameLoop.GameLaunched += OnGameLaunched;
+        }
+
+        /// <summary>
+        /// GameLaunched 事件处理：等所有 Mod 初始化完后再注册 GMCM 配置界面。
+        /// </summary>
+        private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
+        {
+            RegisterGmcmConfig();
+        }
+
+        /// <summary>
+        /// 注册 GenericModConfigMenu 配置界面。
+        /// 注意：不能在 Entry 里调 GetApi——Entry 执行时其他 Mod 可能还没初始化完，
+        /// 此时 GetApi 会返回 null 并触发 SMAPI 警告；必须等 GameLaunched 事件。
+        /// </summary>
+        private void RegisterGmcmConfig()
+        {
+            try
+            {
+                var gmcm = Helper.ModRegistry.GetApi<IGenericModConfigMenuApi>("spacechase0.GenericModConfigMenu");
+                if (gmcm is null)
+                {
+                    Monitor.Log("未检测到 GenericModConfigMenu，跳过游戏内配置界面注册；请手动编辑 Mods/StardewAIAssistant/ModConfig.json", LogLevel.Info);
+                    return;
+                }
+
+                // 注册配置界面：reset 恢复默认，save 写回 JSON 并推送到后端
+                gmcm.Register(
+                    this.ModManifest,
+                    reset: () => _config = new ModConfig(),
+                    save: () =>
+                    {
+                        Helper.WriteConfig(_config);
+                        _ = PushConfigToBackendAsync(_config);
+                    }
+                );
+
+                gmcm.AddTextOption(
+                    this.ModManifest,
+                    getValue: () => _config.Provider,
+                    setValue: v => _config.Provider = v,
+                    name: () => "AI 厂商",
+                    tooltip: () => "deepseek / qwen / zhipu / kimi / ollama",
+                    allowedValues: new[] { "deepseek", "qwen", "zhipu", "kimi", "ollama" }
+                );
+
+                gmcm.AddTextOption(
+                    this.ModManifest,
+                    getValue: () => _config.ApiKey,
+                    setValue: v => _config.ApiKey = v,
+                    name: () => "API Key",
+                    tooltip: () => "云端厂商必填；本地 Ollama 留空"
+                );
+
+                gmcm.AddTextOption(
+                    this.ModManifest,
+                    getValue: () => _config.Model,
+                    setValue: v => _config.Model = v,
+                    name: () => "模型名",
+                    tooltip: () => "如 deepseek-chat / qwen-plus / glm-4-flash / qwen2.5:3b"
+                );
+
+                Monitor.Log("已注册 GenericModConfigMenu 配置界面", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                // GMCM 注册失败不崩溃 Mod，只打日志；玩家仍可手动编辑 ModConfig.json
+                Monitor.Log($"注册 GMCM 配置界面失败：{ex.Message}", LogLevel.Warn);
+            }
         }
 
         /// <summary>
@@ -361,6 +442,41 @@ namespace StardewAIAssistant
         /// </summary>
         internal void EnqueueChatMessageFromPatch(string text)
             => EnqueueChatMessage(text, ChatReplyColor);
+
+        /// <summary>
+        /// 把 GMCM 里的配置推送到 Python 后端（POST /config）。
+        /// GMCM 的 save 回调是同步 Action，所以这里 fire-and-forget：
+        /// 用 _ = 丢弃 Task，方法内部用 try-catch 兜底所有异常。
+        /// </summary>
+        private async Task PushConfigToBackendAsync(ModConfig cfg)
+        {
+            try
+            {
+                // 后端 config.json 的字段名是 snake_case，这里手动映射
+                var payload = new
+                {
+                    provider = cfg.Provider,
+                    api_key = cfg.ApiKey,
+                    model = cfg.Model
+                };
+
+                string json = JsonSerializer.Serialize(payload);
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                // 复用全局 HttpClient（15s 超时），地址硬编码为后端 /config
+                var response = await HttpClient.PostAsync("http://127.0.0.1:8000/config", content);
+                response.EnsureSuccessStatusCode();
+
+                Game1.addHUDMessage(new HUDMessage("AI伴侣：配置已推送到后端"));
+                Monitor.Log($"配置已推送：provider={cfg.Provider}, model={cfg.Model}", LogLevel.Debug);
+            }
+            catch (Exception ex)
+            {
+                // 后端没启动 / 网络错误 / 返回非 2xx 等都走这里
+                Game1.addHUDMessage(new HUDMessage("AI伴侣：后端未启动，配置已保存到本地；启动后端后请重新保存"));
+                Monitor.Log($"推送配置失败：{ex.Message}", LogLevel.Warn);
+            }
+        }
 
         /// <summary>
         /// 发送给 Python 后端的游戏状态数据结构。

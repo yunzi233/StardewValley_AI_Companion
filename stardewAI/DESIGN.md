@@ -93,5 +93,5 @@ C# 收到 {reply, emotion}
 - [x] 多轮记忆（LangGraph + AsyncSqliteSaver：retrieve → chat 对话图，历史按玩家名隔离并落盘 SQLite，重启不丢；2026-10-13）
 - [ ] 浮动精灵
 - [ ] 主动提醒
-- [ ] 游戏内配置界面（当前手动编辑 config.json）；模型参数 temperature 可配置（top-k 已挪进 `aipy/config.py`）
+- [x] 游戏内配置界面（GMCM，2026-10-14）：C# 端 `ModConfig.cs` + `RegisterGmcmConfig`（GameLaunched 事件），Python 端 `POST /config` + `save_config` + `PlaceholderLLM`；配置改完无需重启后端，对话历史保留。
 - [ ] 设置玩家配置界面

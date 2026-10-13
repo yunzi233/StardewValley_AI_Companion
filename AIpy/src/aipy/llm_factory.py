@@ -25,6 +25,15 @@ def load_config() -> dict:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+def save_config(cfg: dict) -> None:
+    """把配置写入 config.json（覆盖写，UTF-8，缩进 2）。
+       供 /config 接口调用，C# 端从游戏里推送的配置落盘用。"""
+    CONFIG_PATH.write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def create_llm(cfg: dict):
     provider = cfg.get("provider", "ollama")
 

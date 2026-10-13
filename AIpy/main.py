@@ -1,14 +1,14 @@
 import traceback
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from langchain_chroma import Chroma
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_ollama import OllamaEmbeddings
 from aipy.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, OLLAMA_BASE_URL, TOP_K
-from aipy.llm_factory import load_config, create_llm
+from aipy.llm_factory import load_config, create_llm, save_config
 from aipy.agent.graph import init_agent, build_graph
 
 app = FastAPI(title="Stardew AI Companion")
@@ -55,6 +55,23 @@ class ChatResponse(BaseModel):
     reply: str
     emotion: str = "happy"
 
+
+class ConfigRequest(BaseModel):
+    provider: str
+    api_key: str = ""
+    model: str
+
+
+# ========== 占位 LLM（未配置时启动用）==========
+class PlaceholderLLM:
+    """config.json 缺失或无效时的占位模型，避免后端启动失败。
+       玩家在游戏里通过 GMCM 保存配置后，/config 接口会重建真实 LLM。"""
+
+    async def ainvoke(self, messages, **kwargs):
+        return AIMessage(
+            content="请先在游戏里配置 AI 厂商和 API Key（ESC → Mod 选项 → Stardew AI Assistant）"
+        )
+
 # ========== 启动时加载向量库（只做一次）==========
 print("正在加载向量库...")
 embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
@@ -67,9 +84,15 @@ retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K})
 print("向量库加载完成")
 
 # ========== 对话模型 ==========
-_config = load_config()
-llm = create_llm(_config)
-print(f"[LLM] provider={_config['provider']}, model={_config['model']}")
+# config.json 不存在或格式错时用 PlaceholderLLM 启动，不阻塞后端；
+# 玩家在游戏里通过 GMCM 保存配置后，/config 接口会重建真实 LLM。
+try:
+    _config = load_config()
+    llm = create_llm(_config)
+    print(f"[LLM] provider={_config['provider']}, model={_config['model']}")
+except Exception as e:
+    print(f"[LLM] 未配置（{type(e).__name__}: {e}），等待游戏内配置推送...")
+    llm = PlaceholderLLM()
 
 # ========== 初始化 LangGraph 对话图 ==========
 init_agent(llm=llm, retriever=retriever, system_prompt=SYSTEM_PROMPT)
@@ -129,3 +152,33 @@ async def chat_endpoint(req: ChatRequest):
     # 成功：最后一条 AI 消息就是回复
     reply = result["messages"][-1].content
     return ChatResponse(reply=reply.strip(), emotion="happy")
+
+
+@app.post("/config")
+async def update_config(cfg: ConfigRequest):
+    """接收 C# 从游戏里推来的配置：写文件 + 重建 LLM + 重新注入 graph"""
+    # 1. 校验
+    if cfg.provider not in ["ollama", "deepseek", "qwen", "zhipu", "kimi"]:
+        raise HTTPException(400, f"不支持的 provider: {cfg.provider}")
+    if cfg.provider != "ollama" and not cfg.api_key.strip():
+        raise HTTPException(400, f"provider={cfg.provider} 时必须填 api_key")
+    if not cfg.model.strip():
+        raise HTTPException(400, "model 不能为空")
+
+    # 2. 写文件
+    save_config({"provider": cfg.provider, "api_key": cfg.api_key, "model": cfg.model})
+
+    # 3. 重建 LLM
+    try:
+        new_llm = create_llm({"provider": cfg.provider, "api_key": cfg.api_key, "model": cfg.model})
+    except Exception as e:
+        print(f"[错误] 重建 LLM 失败：\n{traceback.format_exc()}")
+        raise HTTPException(400, f"配置无效，LLM 创建失败：{e}")
+
+    # 4. 更新全局 + 重新注入 graph（graph.py 的 _llm 是模块级变量，重新 init 即可，不用重建图）
+    global llm
+    llm = new_llm
+    init_agent(llm=new_llm, retriever=retriever, system_prompt=SYSTEM_PROMPT)
+
+    print(f"[LLM] 已切换为 provider={cfg.provider}, model={cfg.model}")
+    return {"status": "ok", "provider": cfg.provider, "model": cfg.model}

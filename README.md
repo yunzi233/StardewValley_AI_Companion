@@ -96,6 +96,7 @@ AI_Projects/
 │   │   ├── ModEntry.cs        # Mod 入口：F7/聊天框两条对话流程、GMCM 配置、线程队列、HTTP 请求
 │   │   ├── ChatBoxTextBoxEnterPatch.cs  # Harmony 补丁：拦截聊天框 "AI " 消息
 │   │   ├── ModConfig.cs       # GMCM 配置模型：Provider / ApiKey / Model
+│   │   ├── libs/              # GMCM 前置：IGenericModConfigMenuApi.cs（入库，用 shared/ 稳定版）+ GenericModConfigMenu.dll（不入库，见编译章节）
 │   │   ├── manifest.json      # SMAPI 清单（UniqueID: yz.StardewAIAssistant）
 │   │   └── StardewAIAssistant.csproj
 │   ├── DESIGN.md              # 设计蓝图（模块规划与数据流）
@@ -233,6 +234,7 @@ dotnet build
 ```
 
 - 编译前请修改 [StardewAIAssistant.csproj](stardewAI/ModTemplate/StardewAIAssistant.csproj) 中的 `GamePath` 为你的游戏安装路径
+- **首次编译前需准备 GMCM 前置 dll**：从 [GenericModConfigMenu 发布页](https://www.nexusmods.com/stardewvalley/mods/5098)下载并解压，把 `GenericModConfigMenu.dll` 放到 `stardewAI/ModTemplate/libs/` 下（该 dll 不入库；`libs/IGenericModConfigMenuApi.cs` 接口文件已随仓库提供，取自 GMCM 仓库 `shared/` 稳定版）
 - build 成功后 DLL 会**自动复制**到 `Mods/StardewAIAssistant` 目录
 - ⚠️ 游戏/SMAPI 开着时 build 会因 DLL 被占用而失败，请先关闭游戏
 - 只想验证语法、不部署：`dotnet build -p:EnableModDeploy=false -p:EnableModZip=false`

@@ -91,7 +91,7 @@ C# 收到 {reply, emotion}
 - [x] BYOK 基础（config.json + LLM 工厂：ollama / deepseek / zhipu / qwen / kimi）
 - [ ] 扩展状态感知（第二批：背包 / 当前工具 / NPC 好感度 / 当日任务；季节天气参与检索 query）
 - [x] 多轮记忆（LangGraph + AsyncSqliteSaver：retrieve → chat 对话图，历史按玩家名隔离并落盘 SQLite，重启不丢；2026-10-13）
-- [ ] 浮动精灵
+- [x] 浮动精灵（第一版，2026-10-14）：`RenderedWorld` 事件绘制，跟随玩家 + sin 浮动；`ModContent.Load` 加载 `assets/robot.png`（64x64）按图片实际尺寸 1:1 绘制，贴图缺失回退方块占位
 - [ ] 主动提醒
 - [x] 游戏内配置界面（GMCM，2026-10-14）：C# 端 `ModConfig.cs` + `RegisterGmcmConfig`（GameLaunched 事件），Python 端 `POST /config` + `save_config` + `PlaceholderLLM`；配置改完无需重启后端，对话历史保留。
 - [ ] 设置玩家配置界面

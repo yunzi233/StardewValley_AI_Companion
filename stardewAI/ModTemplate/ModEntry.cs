@@ -21,6 +21,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using HarmonyLib;
 using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics; // Texture2D（浮动精灵贴图）
 using GenericModConfigMenu;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
@@ -93,6 +94,15 @@ namespace StardewAIAssistant
         /// <summary>玩家通过 GMCM 或 ModConfig.json 配置的 AI 厂商参数。</summary>
         private ModConfig _config = null!;
 
+        /// <summary>跟随玩家的浮动精灵（见 FloatingCompanion.cs，贴图 32x32 占位方块兜底）。</summary>
+        private FloatingCompanion _companion = new();
+
+        /// <summary>
+        /// 浮动精灵的贴图（assets/robot.png）。
+        /// 启动时加载一次；加载失败时保持 null，精灵自动回退到方块占位。
+        /// </summary>
+        private Texture2D? _robotTexture;
+
         public override void Entry(IModHelper helper)
         {
             // 0. 保存单例，供 Harmony 静态补丁使用
@@ -108,6 +118,25 @@ namespace StardewAIAssistant
             //     （本项目即 ChatBoxTextBoxEnterPatch）。
             new Harmony(this.ModManifest.UniqueID).PatchAll();
 
+            // 0.3 加载浮动精灵贴图（assets/robot.png，编译时随项目一起部署到 Mods 目录）。
+            //     只在启动时加载一次，不能放到每帧的 Draw 里；加载失败不致命，
+            //     精灵会回退到白色方块占位，只打警告日志。
+            //     注意：SMAPI 4 把 3.x 的 helper.Content 拆成了两个——
+            //       ModContent.Load = 加载 Mod 文件夹里的原始文件（PNG/JSON 等）
+            //       GameContent.Load = 加载游戏内容管线的 asset（游戏自带的图、音效）
+            //     robot.png 是 Mod 文件夹的原始文件，必须用 ModContent；
+            //     用 GameContent 会去游戏内容管线里找，报资源加载失败。
+            try
+            {
+                _robotTexture = helper.ModContent.Load<Texture2D>("assets/robot.png");
+                _companion.Texture = _robotTexture;
+                Monitor.Log("已加载精灵贴图 assets/robot.png", LogLevel.Debug);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"加载精灵贴图失败（将使用方块占位）：{ex.Message}", LogLevel.Warn);
+            }
+
             // 1. 保留原有 F7 按键监听（事件处理器用 async void 是 C# 的标准写法）
             helper.Events.Input.ButtonPressed += OnButtonPressed;
 
@@ -118,6 +147,11 @@ namespace StardewAIAssistant
             //    原因：Entry 执行时其他 Mod 可能还没加载完，此时 GetApi 会返回 null
             //    并触发 SMAPI 警告 "Tried to access a mod-provided API before all mods were initialized."
             helper.Events.GameLoop.GameLaunched += OnGameLaunched;
+
+            // 4. 订阅 RenderedWorld 事件：在世界层之上绘制浮动精灵。
+            //    该事件由 SMAPI 在每帧世界绘制完成后触发，e.SpriteBatch 仍处于
+            //    Begin/End 之间，可直接叠加绘制；主线程事件，无并发风险。
+            helper.Events.Display.RenderedWorld += OnRenderedWorld;
         }
 
         /// <summary>
@@ -126,6 +160,16 @@ namespace StardewAIAssistant
         private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
         {
             RegisterGmcmConfig();
+        }
+
+        /// <summary>
+        /// RenderedWorld 事件处理：每帧更新并绘制浮动精灵。
+        /// 该事件本身运行在游戏主线程的绘制阶段，直接用事件携带的 SpriteBatch 绘制即可。
+        /// </summary>
+        private void OnRenderedWorld(object? sender, RenderedWorldEventArgs e)
+        {
+            _companion.Update();
+            _companion.Draw(e.SpriteBatch);
         }
 
         /// <summary>

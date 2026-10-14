@@ -23,9 +23,10 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 - LLM 配置化（BYOK 基础）：`config.json` 切换 provider——本地 `ollama`（免 Key）或云端 `deepseek` / `zhipu` / `qwen` / `kimi`（OpenAI 兼容接口，自带 Key）
 - 多轮对话记忆（LangGraph + SQLite 持久化）：AI 记得本次会话聊过的内容，按玩家名隔离历史，**重启后端也不丢**；上下文窗口只带最近 10 轮（完整历史仍存 SQLite，不丢数据）
 - 模型参数可配置：回答温度（temperature）在 GMCM 里调节（0.0-2.0，步长 0.1），随配置推送后端实时生效
+- 浮动精灵（第一版）：跟随玩家移动 + 上下浮动动画（sin 曲线），`assets/robot.png` 贴图 1:1 绘制，贴图缺失自动回退方块占位
 
 **⏳ 规划中：**
-- 浮动精灵 + 主动提醒
+- 主动提醒（精灵主动说话 / 事件触发）
 - 继续扩展状态（背包 / 当前工具 / NPC 好感 / 当日任务）
 
 ## 架构
@@ -93,9 +94,12 @@ AI_Projects/
 │   └── chroma_db/             # 向量库（脚本本地生成，已 gitignore）
 ├── stardewAI/                 # C# SMAPI Mod
 │   ├── ModTemplate/
-│   │   ├── ModEntry.cs        # Mod 入口：F7/聊天框两条对话流程、GMCM 配置、线程队列、HTTP 请求
+│   │   ├── ModEntry.cs        # Mod 入口：F7/聊天框两条对话流程、GMCM 配置、浮动精灵、线程队列、HTTP 请求
 │   │   ├── ChatBoxTextBoxEnterPatch.cs  # Harmony 补丁：拦截聊天框 "AI " 消息
-│   │   ├── ModConfig.cs       # GMCM 配置模型：Provider / ApiKey / Model
+│   │   ├── FloatingCompanion.cs  # 浮动精灵：跟随玩家 + sin 浮动动画，贴图缺失回退方块
+│   │   ├── assets/
+│   │   │   └── robot.png      # 精灵贴图（64x64，随仓库分发，按图片实际尺寸 1:1 绘制）
+│   │   ├── ModConfig.cs       # GMCM 配置模型：Provider / ApiKey / Model / Temperature
 │   │   ├── libs/              # GMCM 前置：IGenericModConfigMenuApi.cs（入库，用 shared/ 稳定版）+ GenericModConfigMenu.dll（不入库，见编译章节）
 │   │   ├── manifest.json      # SMAPI 清单（UniqueID: yz.StardewAIAssistant）
 │   │   └── StardewAIAssistant.csproj

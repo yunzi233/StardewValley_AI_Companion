@@ -108,6 +108,12 @@
     - 原因：3.x 的构造函数要求有 running event loop，而 main.py 是模块顶层同步调 `build_graph()`，此时还没有事件循环；老版本没这个要求，升级即回归。
     - 解决：graph 构建挪进 FastAPI lifespan（`@asynccontextmanager`，startup 阶段在 async 上下文里 `build_graph()`）；顶层只留 `init_agent()` 注入依赖。教训：依赖升级后启动失败，先怀疑第三方包的构造时序变化。
 
+22. **SMAPI 4 把 `helper.Content` 拆成了两个：ModContent / GameContent**
+    - 现象：用 `helper.GameContent.Load<Texture2D>("assets/robot.png")` 加载自己 Mod 文件夹里的 png，运行时报资源加载失败——它去**游戏内容管线**里找，当然没有。
+    - 原因：SMAPI 4 移除了 3.x 的 `helper.Content`，拆成两个：`ModContent.Load` 加载 **Mod 文件夹里的原始文件**（PNG/JSON 等）；`GameContent.Load` 加载**游戏内容管线的 asset**（游戏自带的物品图、音效等）。
+    - 解决：Mod 文件夹内的原始文件用 `helper.ModContent.Load<Texture2D>("assets/robot.png")`。
+    - 顺带确认：`ModBuildConfig` 会把项目目录下的 `assets/` 整个复制到 Mods 输出目录，不需要改 csproj。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -157,28 +163,32 @@
 
 | 方法/类/字段 | 位置 | 作用 |
 |---|---|---|
-| `BackendUrl` | L38 | 后端地址 `http://127.0.0.1:8000/chat` |
-| `HttpClient` | L44 | 全局复用，15 秒超时 |
+| `BackendUrl` | L40 | 后端地址 `http://127.0.0.1:8000/chat` |
+| `HttpClient` | L46 | 全局复用，15 秒超时 |
 | `JsonOptions` | L54 | 小写键名大小写不敏感映射 |
-| `_mainThreadActions` | L65 | 主线程任务队列（HUD 和聊天框消息共用） |
-| `TestQuestions` | L70 | 测试问题池（5 个 RAG 验证问题：鱼/礼物/作物/生日/钓点） |
-| `_questionIndex` | L83 | 问题池轮转下标，取余自增 |
-| `Instance` | L90 | 静态单例，供 Harmony 静态补丁回调实例方法 |
+| `_mainThreadActions` | L67 | 主线程任务队列（HUD 和聊天框消息共用） |
+| `TestQuestions` | L72 | 测试问题池（5 个 RAG 验证问题：鱼/礼物/作物/生日/钓点） |
+| `_questionIndex` | L85 | 问题池轮转下标，取余自增 |
+| `Instance` | L92 | 静态单例，供 Harmony 静态补丁回调实例方法 |
 | `ModEntry`（类） | L30 | Mod 入口，继承 SMAPI 的 `Mod` |
-| `Entry` | L96-121 | 启动时跑一次：单例保存 → `ReadConfig<ModConfig>()` → `Harmony.PatchAll()` → 订阅 ButtonPressed/UpdateTicked/GameLaunched |
-| `OnGameLaunched` | L126-129 | GameLaunched 事件处理：调 RegisterGmcmConfig |
-| `RegisterGmcmConfig` | L136-203 | GetApi → Register + AddTextOption×3 + AddNumberOption（回答温度 0.0-2.0 步长 0.1）；save 回调写 JSON + fire-and-forget 推送后端；try-catch 兜底 |
-| `OnButtonPressed` | L192 | F7 入口（精简后只管：F7 过滤→安检→取测试问题→显示"玩家问"HUD→调 `SendToBackendAsync(useChatBox:false)`） |
-| `OnUpdateTicked` | L147 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
-| `EnqueueHudMessage` | L175 | 把显示 HUD 的动作打包入队（可在后台线程调） |
-| `ChatReplyColor` / `ChatErrorColor` | L201 / L204 | 聊天框回复浅蓝 / 错误橙红的颜色常量 |
-| **`SendToBackendAsync`** | **L216** | **对话核心流程（两入口共用，消除原先 95% 重复）**：收集 10 字段状态→"思考中"→异步 POST→解析→按 `useChatBox` 分支显示→4 个 catch（HttpRequestException/OperationCanceled/Json/Exception） |
-| `HandleAiChatQuestion` | L329 | 聊天框入口（精简后只管：安检→调 `SendToBackendAsync(useChatBox:true)`） |
-| `EnqueueChatMessage` | L349 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
-| `EnqueueChatMessageFromPatch` | L362 | internal 包装，供补丁类调用用法提示 |
-| `PushConfigToBackendAsync` | L464-493 | GMCM save 回调 fire-and-forget：POST /config 推送 provider/api_key/model/temperature 到后端；成功 HUD 提示，失败 HUD+日志 |
-| `GameStateData`（内部类） | L408 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message + 扩展 Season/IsRaining/DayOfMonth/Money/Health |
-| `ChatResponse`（内部类） | L439 | 后端返回模型：Reply/Emotion |
+| `_config` | L95 | GMCM 配置（Provider/ApiKey/Model/Temperature） |
+| `_companion` | L98 | 浮动精灵实例（见 FloatingCompanion.cs 小节） |
+| `_robotTexture` | L104 | 精灵贴图（启动时 ModContent.Load 加载，失败保持 null 走方块占位） |
+| `Entry` | L106-158 | 启动时跑一次：单例保存 → `ReadConfig<ModConfig>()` → `Harmony.PatchAll()` → ModContent.Load 精灵贴图（try-catch 兜底）→ 订阅 ButtonPressed/UpdateTicked/GameLaunched/RenderedWorld |
+| `OnGameLaunched` | L160-163 | GameLaunched 事件处理：调 RegisterGmcmConfig |
+| `OnRenderedWorld` | L169-173 | 每帧世界绘制完成后：`_companion.Update()` + `_companion.Draw(e.SpriteBatch)`（主线程事件，SpriteBatch 仍在 Begin/End 之间可直接叠加绘制） |
+| `RegisterGmcmConfig` | L180-277 | GetApi → Register + AddTextOption×3 + AddNumberOption（回答温度 0.0-2.0 步长 0.1）；save 回调写 JSON + fire-and-forget 推送后端；try-catch 兜底 |
+| `OnButtonPressed` | L252 | F7 入口（精简后只管：F7 过滤→安检→取测试问题→显示"玩家问"HUD→调 `SendToBackendAsync(useChatBox:false)`） |
+| `OnUpdateTicked` | L285 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
+| `EnqueueHudMessage` | L313 | 把显示 HUD 的动作打包入队（可在后台线程调） |
+| `ChatReplyColor` / `ChatErrorColor` | L339 / L342 | 聊天框回复浅蓝 / 错误橙红的颜色常量 |
+| **`SendToBackendAsync`** | **L354** | **对话核心流程（两入口共用，消除原先 95% 重复）**：收集 10 字段状态→"思考中"→异步 POST→解析→按 `useChatBox` 分支显示→4 个 catch（HttpRequestException/OperationCanceled/Json/Exception） |
+| `HandleAiChatQuestion` | L467 | 聊天框入口（精简后只管：安检→调 `SendToBackendAsync(useChatBox:true)`） |
+| `EnqueueChatMessage` | L487 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
+| `EnqueueChatMessageFromPatch` | L500 | internal 包装，供补丁类调用用法提示 |
+| `PushConfigToBackendAsync` | L508-537 | GMCM save 回调 fire-and-forget：POST /config 推送 provider/api_key/model/temperature 到后端；成功 HUD 提示，失败 HUD+日志 |
+| `GameStateData`（内部类） | L544 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message + 扩展 Season/IsRaining/DayOfMonth/Money/Health |
+| `ChatResponse`（内部类） | L575 | 后端返回模型：Reply/Emotion |
 
 ### C# 端：`ModTemplate/ModConfig.cs`（GMCM 配置模型）
 
@@ -196,6 +206,16 @@
 | `[HarmonyPatch]` 特性 | L24 | 目标 `ChatBox.textBoxEnter(string)` 重载（靠 `new[]{typeof(string)}` 区分） |
 | `AiPrefix` | L28 | 常量 `"AI "`（大写 AI + 半角空格） |
 | `Prefix` | L34 | Trim 后判断前缀：非 AI 消息 `return true` 放行；空问题回用法提示；正常问题回调 `Instance.HandleAiChatQuestion` 后 `return false` 跳过原版发送 |
+
+### C# 端：`ModTemplate/FloatingCompanion.cs`（浮动精灵，新增）
+
+| 成员 | 位置 | 作用 |
+|---|---|---|
+| `OffsetFromPlayer` | L18 | 相对玩家的偏移 (40, -70)：右侧、头顶上方（世界像素） |
+| `Texture` | L24 | 精灵贴图，ModEntry 启动时注入；null（素材缺失）时 Draw 回退方块占位 |
+| `_bobPhase` | L27 | 浮动动画相位，每帧累加 `dt * 3f`（速度），sin 曲线驱动 |
+| `Update` | L32-35 | 推进浮动相位（用 `Game1.currentGameTime` 的帧间隔） |
+| `Draw` | L39-77 | `Context.IsWorldReady` 安检 → 玩家 `getStandingPosition()` + 偏移 → sin 浮动（幅度 4px）→ `Game1.GlobalToLocal` 世界坐标转屏幕坐标 → 1:1 绘制贴图（layerDepth 0.9：盖住地面、被玩家/NPC 遮挡） |
 
 ### Python 端：`AIpy/main.py`（FastAPI 入口 + LangGraph 调度）
 

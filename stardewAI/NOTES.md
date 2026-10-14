@@ -114,6 +114,16 @@
     - 解决：Mod 文件夹内的原始文件用 `helper.ModContent.Load<Texture2D>("assets/robot.png")`。
     - 顺带确认：`ModBuildConfig` 会把项目目录下的 `assets/` 整个复制到 Mods 输出目录，不需要改 csproj。
 
+23. **SMAPI 4 没有任何文本输入事件：中文 IME 只能直连 MonoGame 的 `GameWindow.TextInput`**
+    - 背景：想自研中文输入框，但 `Keyboard.GetState()` 只报物理键，收不到输入法上屏的字符，必须接窗口的文本事件。
+    - 反射查证（MetadataLoadContext 扫 StardewModdingAPI.dll / MonoGame.Framework.dll / Stardew Valley.dll）：
+      - SMAPI 4 的 `IInputEvents` 只有 5 个事件（ButtonsChanged / ButtonPressed / ButtonReleased / CursorMoved / MouseWheelScrolled），**没有 TextInput / TextEdited**（3.x 曾有，4.0 移除）；`StardewModdingAPI.Events` 命名空间下也没有相关 EventArgs。
+      - MonoGame 侧存在：`Microsoft.Xna.Framework.GameWindow.TextInput`，签名 `event EventHandler<Microsoft.Xna.Framework.TextInputEventArgs> TextInput`。
+      - `TextInputEventArgs` 是 **struct**，成员是**公共字段不是属性**：`char Character`（IME 上屏字符，中文逐字触发一次事件）、`Keys Key`（IME 输入时不可靠，别依赖）。
+      - `Game1.game1` 是 **public static** 字段；GameLaunched 时窗口已创建，可安全订阅。
+    - 解决：GameLaunched 里 `Game1.game1.Window.TextInput += OnWindowTextInput;`，回调读 `e.Character`；`\r \n \b \t` 等控制字符用 `char.IsControl` 过滤，Enter/Esc/Backspace 走 SMAPI ButtonPressed 分支（双保险）。
+    - 字符链路：SDL_TEXTINPUT → `Sdl.Keyboard.TextInputEvent` → `GameWindow.TextInput`（DesktopGL 版，反射见到 Sdl+Keyboard+TextInputEvent 佐证）。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -157,6 +167,13 @@
    - 注册：`Register` + `AddTextOption` 三连 + `AddNumberOption`（数值参数如 temperature 用它，min/max/interval 是 `float?` 可空参数）；save 回调是同步 `Action`，里面要 fire-and-forget 异步推送（`_ = PushConfigToBackendAsync(...)`）。
    - 接口文件：必须用 GMCM 仓库 `shared/` 目录下的版本，framework/ 是内部开发版（见踩坑 20）。
 
+9. **中文 IME 输入框的按键接管（v0.9 自研输入框）**
+   - 字符流：只在 `IsOpen` 时接收 `Window.TextInput` 的 `e.Character`，控制字符（`char.IsControl`）一律丢弃。
+   - 按键流：输入框打开期间 `Helper.Input.Suppress(e.Button)` 吃掉所有按键——SMAPI 会屏蔽到按键释放为止，角色不会移动、游戏不响应；Esc / Enter / Backspace 在 Suppress 之后自行处理。
+   - 提交复用：回车后调 `HandleAiChatQuestion(text)`（与聊天框补丁同一入口），回复照常进聊天框。
+   - 显示：`RenderedHud` 事件里用 `Game1.smallFont` 画一行文本（中文版字体图集含汉字，实测中文正常显示）。
+   - 打开键是硬编码 F7；GMCM 有 `AddKeybindList`（接口文件 L112），后续配置化时 ModConfig 字段用 `KeybindList` 类型即可。
+
 ## 三、代码地图
 
 ### C# 端：`ModTemplate/ModEntry.cs`
@@ -167,28 +184,29 @@
 | `HttpClient` | L46 | 全局复用，15 秒超时 |
 | `JsonOptions` | L54 | 小写键名大小写不敏感映射 |
 | `_mainThreadActions` | L67 | 主线程任务队列（HUD 和聊天框消息共用） |
-| `TestQuestions` | L72 | 测试问题池（5 个 RAG 验证问题：鱼/礼物/作物/生日/钓点） |
-| `_questionIndex` | L85 | 问题池轮转下标，取余自增 |
-| `Instance` | L92 | 静态单例，供 Harmony 静态补丁回调实例方法 |
+| `Instance` | L74 | 静态单例，供 Harmony 静态补丁回调实例方法 |
 | `ModEntry`（类） | L30 | Mod 入口，继承 SMAPI 的 `Mod` |
-| `_config` | L95 | GMCM 配置（Provider/ApiKey/Model/Temperature） |
-| `_companion` | L98 | 浮动精灵实例（见 FloatingCompanion.cs 小节） |
-| `_robotTexture` | L104 | 精灵贴图（启动时 ModContent.Load 加载，失败保持 null 走方块占位） |
-| `Entry` | L106-158 | 启动时跑一次：单例保存 → `ReadConfig<ModConfig>()` → `Harmony.PatchAll()` → ModContent.Load 精灵贴图（try-catch 兜底）→ 订阅 ButtonPressed/UpdateTicked/GameLaunched/RenderedWorld |
-| `OnGameLaunched` | L160-163 | GameLaunched 事件处理：调 RegisterGmcmConfig |
-| `OnRenderedWorld` | L169-173 | 每帧世界绘制完成后：`_companion.Update()` + `_companion.Draw(e.SpriteBatch)`（主线程事件，SpriteBatch 仍在 Begin/End 之间可直接叠加绘制） |
-| `RegisterGmcmConfig` | L180-277 | GetApi → Register + AddTextOption×3 + AddNumberOption（回答温度 0.0-2.0 步长 0.1）；save 回调写 JSON + fire-and-forget 推送后端；try-catch 兜底 |
-| `OnButtonPressed` | L252 | F7 入口（精简后只管：F7 过滤→安检→取测试问题→显示"玩家问"HUD→调 `SendToBackendAsync(useChatBox:false)`） |
-| `OnUpdateTicked` | L285 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
-| `EnqueueHudMessage` | L313 | 把显示 HUD 的动作打包入队（可在后台线程调） |
-| `ChatReplyColor` / `ChatErrorColor` | L339 / L342 | 聊天框回复浅蓝 / 错误橙红的颜色常量 |
-| **`SendToBackendAsync`** | **L354** | **对话核心流程（两入口共用，消除原先 95% 重复）**：收集 10 字段状态→"思考中"→异步 POST→解析→按 `useChatBox` 分支显示→4 个 catch（HttpRequestException/OperationCanceled/Json/Exception） |
-| `HandleAiChatQuestion` | L467 | 聊天框入口（精简后只管：安检→调 `SendToBackendAsync(useChatBox:true)`） |
-| `EnqueueChatMessage` | L487 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
-| `EnqueueChatMessageFromPatch` | L500 | internal 包装，供补丁类调用用法提示 |
-| `PushConfigToBackendAsync` | L508-537 | GMCM save 回调 fire-and-forget：POST /config 推送 provider/api_key/model/temperature 到后端；成功 HUD 提示，失败 HUD+日志 |
-| `GameStateData`（内部类） | L544 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message + 扩展 Season/IsRaining/DayOfMonth/Money/Health |
-| `ChatResponse`（内部类） | L575 | 后端返回模型：Reply/Emotion |
+| `_config` | L77 | GMCM 配置（Provider/ApiKey/Model/Temperature） |
+| `_companion` | L80 | 浮动精灵实例（见 FloatingCompanion.cs 小节） |
+| `_inputBox` | L87 | 中文输入框实例（见 ChineseInputBox.cs 小节） |
+| `_robotTexture` | L93 | 精灵贴图（启动时 ModContent.Load 加载，失败保持 null 走方块占位） |
+| `Entry` | L95-151 | 启动时跑一次：单例保存 → `ReadConfig<ModConfig>()` → `Harmony.PatchAll()` → ModContent.Load 精灵贴图（try-catch 兜底）→ 订阅 ButtonPressed/UpdateTicked/GameLaunched/RenderedWorld/RenderedHud |
+| `OnGameLaunched` | L153-164 | GameLaunched 事件处理：RegisterGmcmConfig + 订阅 `Game1.game1.Window.TextInput`（中文 IME 唯一入口，见踩坑 23） |
+| `OnRenderedWorld` | L170-174 | 每帧世界绘制完成后：`_companion.Update()` + `_companion.Draw(e.SpriteBatch)` |
+| `OnWindowTextInput` | L182-186 | MonoGame 原生文本输入回调：`IsOpen && !char.IsControl(e.Character)` 才 Append（中文 IME 上屏逐字触发） |
+| `OnRenderedHud` | L193-201 | 输入框打开时屏幕底部画 `输入框：<文本>_`（`Game1.smallFont`，占位样式） |
+| `RegisterGmcmConfig` | L208-282 | GetApi → Register + AddTextOption×3 + AddNumberOption（回答温度 0.0-2.0 步长 0.1）；save 回调写 JSON + fire-and-forget 推送后端；try-catch 兜底 |
+| `OnButtonPressed` | L285-324 | F7 开关输入框；打开期间 `Helper.Input.Suppress` 吃掉所有按键 → Enter 提交（复用 `HandleAiChatQuestion`）/ Esc 关闭 / Back 删除末尾字符 |
+| `OnUpdateTicked` | L329 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
+| `EnqueueHudMessage` | L357 | 把显示 HUD 的动作打包入队（可在后台线程调） |
+| `ChatReplyColor` / `ChatErrorColor` | L383 / L386 | 聊天框回复浅蓝 / 错误橙红的颜色常量 |
+| **`SendToBackendAsync`** | **L398** | **对话核心流程（两入口共用）**：收集 14 字段状态→"思考中"→异步 POST→解析→按 `useChatBox` 分支显示→4 个 catch（HttpRequestException/OperationCanceled/Json/Exception） |
+| `HandleAiChatQuestion` | L520 | 聊天框/输入框共用提交入口（安检→调 `SendToBackendAsync(useChatBox:true)`） |
+| `EnqueueChatMessage` | L540 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
+| `EnqueueChatMessageFromPatch` | L553 | internal 包装，供补丁类调用用法提示 |
+| `PushConfigToBackendAsync` | L561-590 | GMCM save 回调 fire-and-forget：POST /config 推送 provider/api_key/model/temperature；成功 HUD 提示，失败 HUD+日志 |
+| `GameStateData`（内部类） | L597 | 发给后端的模型共 14 字段：基础 5（PlayerName/Stamina/GameTime/Location/Message）+ 第一批 5（Season/IsRaining/DayOfMonth/Money/Health）+ 第二批 4（CurrentTool/FarmingLevel/MiningLevel/DaysPlayed） |
+| `ChatResponse`（内部类） | L641 | 后端返回模型：Reply/Emotion |
 
 ### C# 端：`ModTemplate/ModConfig.cs`（GMCM 配置模型）
 
@@ -216,6 +234,19 @@
 | `_bobPhase` | L27 | 浮动动画相位，每帧累加 `dt * 3f`（速度），sin 曲线驱动 |
 | `Update` | L32-35 | 推进浮动相位（用 `Game1.currentGameTime` 的帧间隔） |
 | `Draw` | L39-77 | `Context.IsWorldReady` 安检 → 玩家 `getStandingPosition()` + 偏移 → sin 浮动（幅度 4px）→ `Game1.GlobalToLocal` 世界坐标转屏幕坐标 → 1:1 绘制贴图（layerDepth 0.9：盖住地面、被玩家/NPC 遮挡） |
+
+### C# 端：`ModTemplate/ChineseInputBox.cs`（中文 IME 输入框，v0.9 新增）
+
+| 成员 | 位置 | 作用 |
+|---|---|---|
+| `IsOpen` | L17 | 输入框开关（打开期间按键全接管） |
+| `Text` | L20 | 当前输入文本（支持中文） |
+| `Open` / `Close` | L26 / L32 | 打开（清空旧内容）/ 关闭（清空文本） |
+| `Append` | L39 | 追加一个字符（由 ModEntry 的 OnWindowTextInput 调用，控制字符已过滤） |
+| `Backspace` | L43 | 删除末尾字符（`Text[..^1]` 范围语法） |
+| `Clear` | L50 | 清空文本，保持打开状态 |
+
+纯状态类：字符接收（`Window.TextInput`）、按键分发（`ButtonPressed`）、HUD 绘制都在 ModEntry.cs。
 
 ### Python 端：`AIpy/main.py`（FastAPI 入口 + LangGraph 调度）
 
@@ -296,16 +327,16 @@
   - C# 抽 `SendToBackendAsync` 合并 F7/聊天框两入口（删 ~80 行重复，霰弹式修改消失）
   - Python `/chat` 加两层 try-except，失败返回友好文本而非 500，traceback 打完整堆栈
   - 新建 `aipy/config.py` 集中管理嵌入模型/集合名/检索 top-k/路径，消除 main.py 与 build_knowledge_base.py 之间的 5 处硬编码
-- [ ] 游戏内输入框自研方案：已被"原版聊天框"方案替代，除非以后要富文本/特殊 UI，否则不再做。
+- [x] 游戏内输入框自研方案（2026-10-14，v0.9）：F7 中文输入框落地——SMAPI 4 无 TextInput 事件，直连 MonoGame `GameWindow.TextInput`（见踩坑 23）；F7 测试问题池（TestQuestions/_questionIndex）已删除。
 - [ ] 加防连点：思考中重复提问应忽略或排队，别刷一堆请求（F7 和聊天框两个入口都要防）。
-- [ ] 扩展状态感知第二批：背包、当前工具、当日任务、NPC 好感等；并考虑把季节/天气拼进检索 query（目前只进 LLM 上下文）。
+- [x] 扩展状态感知第二批 a（2026-10-14）：CurrentTool / FarmingLevel / MiningLevel / DaysPlayed 全链路（C# GameStateData → Python ChatRequest（带默认值向后兼容）→ chat_node 状态块加工具行（空手不显示，英文名→中文映射）/ 技能等级行 / 存档天数行）。
 - [x] 多轮对话记忆（2026-10-12）：LangGraph 对话图（retrieve → chat）+ Checkpointer，`thread_id=玩家名` 隔离历史；检索/拼提示词/调 LLM 下沉到图节点，main.py 只剩调度。
 - [x] 记忆持久化（2026-10-13）：MemorySaver 换 AsyncSqliteSaver，历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢（同步版 SqliteSaver 不支持 async，见踩坑 19）。
 - [x] 历史长度上限（2026-10-13）：chat_node 只把最近 20 条（`[-21:-1]`，约 10 轮）塞给 LLM，更早历史仍完整留在 SQLite；token 成本可控且不丢数据。
 - [x] 游戏内配置界面（GMCM，2026-10-14）：C# 端 `ModConfig.cs` + `RegisterGmcmConfig`（GameLaunched 事件），Python 端 `POST /config` + `save_config` + `PlaceholderLLM`；配置改完无需重启后端，对话历史保留。
 - [x] 模型参数可配置（2026-10-14）：temperature 全链路打通——C# `ModConfig.Temperature` + GMCM `AddNumberOption`（0.0-2.0 步长 0.1）→ `POST /config`（校验 0.0-2.0）→ `save_config` 落盘 → `create_llm` 读 cfg 重建 LLM 实时生效；检索 top-k 已挪进 `aipy/config.py`（2026-10-12）。
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
-- [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键。
+- [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键（已调研：GMCM 有 `AddKeybind`/`AddKeybindList` API，见 libs 接口文件 L103/L112，ModConfig 字段用 `KeybindList` 类型即可，SMAPI 原生支持序列化）。
 - [ ] emotion 现在固定 happy 只打日志（失败时返回 error），后面接表情/立绘显示。
 - [ ] main.py L12 有一行未使用的 `from langchain.chat_models import init_chat_model`，下次改动时顺手清理。
 
@@ -317,7 +348,7 @@
 - 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `AIpy/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
 - 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
-- 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 10 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
+- 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 14 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/CurrentTool/FarmingLevel/MiningLevel/DaysPlayed/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
 - 多轮记忆：LangGraph `AsyncSqliteSaver`（SQLite 落盘 `AIpy/data/checkpoints.db`），`thread_id` 用玩家名隔离；重启后端历史不丢，删该文件即清空（见核心机制备忘第 7 条、踩坑 19）。
 - Harmony：dll 在 `D:\Steam\steamapps\common\Stardew Valley\smapi-internal\0Harmony.dll`，csproj 显式引用 + `Private=false`；Entry 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 安装。
 - 编译命令：在 `ModTemplate` 目录下 `dotnet build`。

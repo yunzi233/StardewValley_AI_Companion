@@ -63,6 +63,11 @@ class ChatRequest(BaseModel):
     DayOfMonth: int = 1
     Money: int = 500
     Health: int = 100
+    # ========== 【扩展状态感知】第二批新增字段（都有默认值，C# 老版本不传也不崩） ==========
+    CurrentTool: str = ""       # 当前手持工具名（游戏内原名），空手为 ""
+    FarmingLevel: int = 0       # 耕种等级（0-10）
+    MiningLevel: int = 0        # 采矿等级（0-10）
+    DaysPlayed: int = 0         # 存档已玩总天数
 
 
 class ChatResponse(BaseModel):
@@ -133,6 +138,11 @@ async def chat_endpoint(req: ChatRequest):
         "day_of_month": req.DayOfMonth,
         "money": req.Money,
         "health": req.Health,
+        # 【扩展状态感知】第二批新增字段
+        "current_tool": req.CurrentTool,
+        "farming_level": req.FarmingLevel,
+        "mining_level": req.MiningLevel,
+        "days_played": req.DaysPlayed,
     }
 
     # 调 LangGraph：retrieve → chat，Checkpointer 自动维护历史

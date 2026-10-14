@@ -2,24 +2,24 @@
 
 一个由 **SMAPI Mod（C#）+ 本地 Python AI 后端（FastAPI + LangChain + LangGraph）** 组成的星露谷物语 AI 陪伴系统，**支持 RAG 知识库检索**（ChromaDB + bge-m3）与**多轮对话记忆**，对话模型**本地 Ollama / 云端 API（DeepSeek、智谱、通义、Kimi）可一键切换**。
 
-两种对话方式：
+三种对话方式：
 
+- **中文输入框（推荐）**：按 **F7** 打开自研输入框，直接用输入法打中文（IME 正常上屏），回车提问——回复显示在聊天框里（浅蓝色，可翻历史）；输入期间按键全部接管（角色不动、游戏不响应），Esc 随时关闭
 - **原版聊天框**：游戏中按 **T** 打开原版聊天框，输入 `AI 海莉喜欢什么礼物` 回车——AI 回复直接显示在聊天框里（浅蓝色，可翻历史）；不带 `AI ` 前缀的消息一切照原版走
-- **F7 快捷测试**：轮流发送内置的 5 个测试问题，回复显示在 HUD，用于调试
 
-AI 会实时读取游戏状态（名字、体力、血量、时间、日期、季节、天气、地点、金币），检索本地游戏知识库，记得本次会话聊过的内容（多轮记忆），并给出基于资料的回答。
+AI 会实时读取游戏状态（名字、体力、血量、时间、日期、季节、天气、地点、金币、手持工具、耕种/采矿等级、存档天数），检索本地游戏知识库，记得本次会话聊过的内容（多轮记忆），并给出基于资料的回答。
 
 > **最终目标**：让一个漂浮在玩家身旁的小机器人陪伴你冒险——它感知玩家状态机，结合游戏知识库（RAG）进行多轮智能对话。
 
 ---
 
-## 当前进度（v0.7 · 多轮记忆）
+## 当前进度（v0.9 · 中文输入框）
 
 **✅ 已完成：**
 - 端到端通信（C# ↔ Python，HTTP + JSON）
-- 游戏内自由提问：原版聊天框输入 `AI 问题`（Harmony 拦截提交，回复进聊天框）；F7 保留为快捷测试
+- 游戏内自由提问：**F7 中文输入框**（IME 正常上屏，按键全接管）或原版聊天框输入 `AI 问题`（Harmony 拦截提交），回复都进聊天框
 - RAG 知识库（ChromaDB + bge-m3 嵌入，已收录作物 / 鱼类 / NPC 礼物）
-- 游戏状态感知：名字 / 体力 / 血量 / 游戏时间 / 日期（1-28）/ 季节 / 是否下雨 / 地点 / 金币
+- 游戏状态感知：名字 / 体力 / 血量 / 游戏时间 / 日期（1-28）/ 季节 / 是否下雨 / 地点 / 金币 / 手持工具 / 耕种 & 采矿等级 / 存档已玩天数
 - LLM 配置化（BYOK 基础）：`config.json` 切换 provider——本地 `ollama`（免 Key）或云端 `deepseek` / `zhipu` / `qwen` / `kimi`（OpenAI 兼容接口，自带 Key）
 - 多轮对话记忆（LangGraph + SQLite 持久化）：AI 记得本次会话聊过的内容，按玩家名隔离历史，**重启后端也不丢**；上下文窗口只带最近 10 轮（完整历史仍存 SQLite，不丢数据）
 - 模型参数可配置：回答温度（temperature）在 GMCM 里调节（0.0-2.0，步长 0.1），随配置推送后端实时生效
@@ -32,8 +32,8 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 ## 架构
 
 ```
-[按 T 聊天框] --Harmony 拦截--> [C# Mod (ModEntry.cs)]
-[按 F7 测试]  -----------------> [C# Mod (ModEntry.cs)]
+[按 F7 输入框] --IME 文本 (GameWindow.TextInput)--> [C# Mod (ModEntry.cs)]
+[按 T 聊天框] --Harmony 拦截 "AI " 前缀-----------> [C# Mod (ModEntry.cs)]
                                       |
                                       v HTTP POST /chat
                               [FastAPI :8000]
@@ -99,6 +99,7 @@ AI_Projects/
 │   │   ├── FloatingCompanion.cs  # 浮动精灵：跟随玩家 + sin 浮动动画，贴图缺失回退方块
 │   │   ├── assets/
 │   │   │   └── robot.png      # 精灵贴图（64x64，随仓库分发，按图片实际尺寸 1:1 绘制）
+│   │   ├── ChineseInputBox.cs # 中文 IME 输入框（F7 开关，纯状态类；字符接收与绘制在 ModEntry）
 │   │   ├── ModConfig.cs       # GMCM 配置模型：Provider / ApiKey / Model / Temperature
 │   │   ├── libs/              # GMCM 前置：IGenericModConfigMenuApi.cs（入库，用 shared/ 稳定版）+ GenericModConfigMenu.dll（不入库，见编译章节）
 │   │   ├── manifest.json      # SMAPI 清单（UniqueID: yz.StardewAIAssistant）
@@ -317,6 +318,8 @@ dotnet build
   "GameTime": 1330, "DayOfMonth": 12,
   "Season": "summer", "IsRaining": false,
   "Location": "Farm", "Money": 5320,
+  "CurrentTool": "WateringCan", "FarmingLevel": 3,
+  "MiningLevel": 2, "DaysPlayed": 41,
   "Message": "海莉喜欢什么礼物？"
 }
 ```
@@ -334,9 +337,13 @@ dotnet build
 | `IsRaining` | bool | 今天是否下雨 |
 | `Location` | string | 当前地点（如 `Farm`） |
 | `Money` | int | 当前金币 |
+| `CurrentTool` | string | 当前手持工具名（游戏内原名如 `WateringCan`），空手为 `""` |
+| `FarmingLevel` | int | 耕种等级（0-10） |
+| `MiningLevel` | int | 采矿等级（0-10） |
+| `DaysPlayed` | int | 存档已玩总天数 |
 | `Message` | string | 玩家问题 |
 
-- `Message` 为玩家问题（主要来自聊天框 `AI ` 提问，F7 测试时来自内置问题池）；后端优先用它做向量检索，为空时回退为当前场景描述（地点/时间/体力）
+- `Message` 为玩家问题（来自 F7 中文输入框或聊天框 `AI ` 提问）；后端优先用它做向量检索，为空时回退为当前场景描述（地点/时间/体力）
 - 其余状态字段**不参与检索**，由后端整理成结构化中文状态块（季节会译为"春季"、`IsRaining` 译为"正在下雨/天气晴朗"）注入 LLM 提示词
 
 **响应**（小写键名，C# 端通过 `PropertyNameCaseInsensitive` 映射）：
@@ -369,13 +376,15 @@ dotnet build
 - [x] 接入真实 LLM：本地 Ollama + LangChain（`qwen2.5:3b`）
 - [x] RAG 知识库：ChromaDB + bge-m3，已收录作物 / 鱼类 / NPC 礼物
 - [x] 扩充状态感知（第一批）：季节、天气、日期、金币、血量（C# 收集 + Python 注入提示词）
-- [x] 游戏内自由提问：借原版聊天框实现（按 T → `AI 问题` → Harmony 拦截），绕开了自研输入框的中文 IME 难题；回复进聊天框可翻历史
+- [x] 游戏内自由提问：借原版聊天框实现（按 T → `AI 问题` → Harmony 拦截），回复进聊天框可翻历史；v0.9 起另有 F7 中文输入框（见下）
 - [x] LLM provider / 模型可配置：`config.json` + LLM 工厂，支持 ollama / deepseek / zhipu / qwen / kimi（BYOK 基础）
 - [x] 游戏内配置界面（GMCM，2026-10-14）：ESC → Mod 选项 → 填厂商/Key/模型 → 保存推送后端 `POST /config`，写文件 + 重建 LLM，无需重启；无 GMCM 时可手动编辑 `src/aipy/config.json`
 - [x] 模型参数可配置化（2026-10-14）：temperature 全链路打通——GMCM 数值选项 → `POST /config`（校验 0.0-2.0）→ 写 config.json → 重建 LLM 实时生效；检索 top-k 已挪进 `aipy/config.py`
-- [ ] 漂浮机器人：贴图渲染、跟随玩家移动、待机动画
+- [x] 中文 IME 输入框（v0.9，2026-10-14）：F7 开关自研输入框，直连 MonoGame `GameWindow.TextInput` 接收 IME 上屏字符（SMAPI 4 无 TextInput 封装，见 NOTES 踩坑 23）；打开期间按键全接管防误操作，回车复用聊天框回复链路
+- [x] 漂浮机器人（第一版，2026-10-14）：robot.png 贴图渲染 + 跟随玩家 + sin 浮动动画
+- [x] 扩充状态感知（第二批 a，2026-10-14）：当前工具 / 耕种 / 采矿等级 / 存档天数
 - [ ] 防连点：思考中重复提问应忽略或排队
-- [ ] 扩充状态感知（第二批）：背包、当前工具、NPC 好感、当日任务；并让季节/天气参与检索 query
+- [ ] 扩充状态感知（第二批 b）：背包、NPC 好感、当日任务；并让季节/天气参与检索 query
 - [x] 多轮对话记忆：LangGraph 对话图 + AsyncSqliteSaver（SQLite 落盘 `AIpy/data/checkpoints.db`），按玩家名隔离历史，重启后端不丢
 - [ ] F7 / `AI ` 前缀改为可配置，避免与其他 Mod 冲突
 - [ ] `emotion` 字段驱动机器人表情 / 立绘变化

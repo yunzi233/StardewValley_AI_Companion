@@ -43,6 +43,11 @@ async def chat_node(state: State):
     season_cn = {"spring": "春季", "summer": "夏季",
                  "fall": "秋季", "winter": "冬季"}.get(ps.get("season", ""), ps.get("season", ""))
     weather_text = "正在下雨" if ps.get("is_raining") else "天气晴朗"
+    # 工具名翻译：游戏内原名 → 中文；映射表没有的工具直接显示原名。
+    # 空手时 current_tool 为 ""，状态块里不写工具行。
+    tool_cn = {"Axe": "斧头", "Pickaxe": "镐子", "Hoe": "锄头", "WateringCan": "水壶",
+               "Scythe": "镰刀"}.get(ps.get("current_tool", ""), ps.get("current_tool", ""))
+    tool_line = f"- 工具：{tool_cn}\n" if ps.get("current_tool") else ""
 
     # 本轮玩家原话
     current_question = state["messages"][-1].content
@@ -57,9 +62,12 @@ async def chat_node(state: State):
         f"- 季节：{season_cn}，第 {ps['day_of_month']} 天\n"
         f"- 天气：{weather_text}\n"
         f"- 时间：{ps['game_time']}\n"
+        f"{tool_line}"
+        f"- 技能：耕种 Lv.{ps.get('farming_level', 0)} / 采矿 Lv.{ps.get('mining_level', 0)}\n"
         f"- 体力：{ps['stamina']:.0f} / 270\n"
         f"- 血量：{ps['health']} / 100\n"
-        f"- 金币：{ps['money']}\n\n"
+        f"- 金币：{ps['money']}\n"
+        f"- 进度：存档已玩 {ps.get('days_played', 0)} 天\n\n"
         f"【玩家的问题】\n{current_question}\n\n"
         f"【参考资料】\n{state['context']}\n\n"
         f"请结合游戏状态和参考资料回答玩家的问题。"

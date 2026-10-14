@@ -67,24 +67,6 @@ namespace StardewAIAssistant
         private readonly Queue<Action> _mainThreadActions = new();
 
         /// <summary>
-        /// 【新增】预设的测试问题池。每次按 F7 轮流取一个发给 Python 后端。
-        /// </summary>
-        private static readonly string[] TestQuestions =
-        {
-            "夏季晴天能钓什么鱼？",
-            "海莉喜欢什么礼物？",
-            "春季种什么最赚钱？",
-            "亚历克斯的生日是什么时候？",
-            "太阳鱼在什么地方钓？"
-        };
-
-        /// <summary>
-        /// 【新增】当前轮到问题池里的第几个问题。
-        /// 按下 F7 后取余自增，实现 0→1→...→4→0 循环。
-        /// </summary>
-        private int _questionIndex = 0;
-
-        /// <summary>
         /// 全局单例引用。
         /// Harmony 的 Prefix 补丁方法必须是 static，没法直接拿到 Mod 实例，
         /// 所以在 Entry 里把 this 存到这里，补丁拦截到 "AI " 消息后通过它回调实例方法。
@@ -94,8 +76,15 @@ namespace StardewAIAssistant
         /// <summary>玩家通过 GMCM 或 ModConfig.json 配置的 AI 厂商参数。</summary>
         private ModConfig _config = null!;
 
-        /// <summary>跟随玩家的浮动精灵（见 FloatingCompanion.cs，贴图 32x32 占位方块兜底）。</summary>
+        /// <summary>跟随玩家的浮动精灵（见 FloatingCompanion.cs，贴图缺失时方块占位）。</summary>
         private FloatingCompanion _companion = new();
+
+        /// <summary>
+        /// 中文 IME 输入框（最小原型，见 ChineseInputBox.cs）。
+        /// F7 开关；打开期间按键全部 Suppress（角色不动），
+        /// 字符经 Game1.game1.Window.TextInput 事件流入（中文 IME 上屏唯一入口）。
+        /// </summary>
+        private readonly ChineseInputBox _inputBox = new();
 
         /// <summary>
         /// 浮动精灵的贴图（assets/robot.png）。
@@ -137,7 +126,7 @@ namespace StardewAIAssistant
                 Monitor.Log($"加载精灵贴图失败（将使用方块占位）：{ex.Message}", LogLevel.Warn);
             }
 
-            // 1. 保留原有 F7 按键监听（事件处理器用 async void 是 C# 的标准写法）
+            // 1. 按键监听：F7 开关中文输入框；输入框打开期间接管按键（见 OnButtonPressed）
             helper.Events.Input.ButtonPressed += OnButtonPressed;
 
             // 2. 注册每帧 Tick 事件：在游戏主线程上执行排队任务（用于安全显示 HUD/聊天消息）
@@ -152,14 +141,26 @@ namespace StardewAIAssistant
             //    该事件由 SMAPI 在每帧世界绘制完成后触发，e.SpriteBatch 仍处于
             //    Begin/End 之间，可直接叠加绘制；主线程事件，无并发风险。
             helper.Events.Display.RenderedWorld += OnRenderedWorld;
+
+            // 5. 订阅 RenderedHud 事件：中文输入框打开时在屏幕底部画当前文本
+            helper.Events.Display.RenderedHud += OnRenderedHud;
         }
 
         /// <summary>
-        /// GameLaunched 事件处理：等所有 Mod 初始化完后再注册 GMCM 配置界面。
+        /// GameLaunched 事件处理：等所有 Mod 初始化完后再注册 GMCM 配置界面；
+        /// 并订阅 MonoGame 原生文本输入事件（中文 IME 上屏的唯一入口）。
         /// </summary>
         private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
         {
             RegisterGmcmConfig();
+
+            // 订阅 MonoGame 的 GameWindow.TextInput 事件。
+            // 为什么放这里：SMAPI 4 的 Input 事件没有 TextInput 封装（反射确认
+            // IInputEvents 只有 5 个事件），必须直接接 MonoGame 窗口事件；
+            // GameLaunched 时游戏窗口已创建，Game1.game1（public static）非空。
+            // 注意：TextInputEventArgs 是 struct，字符在公共字段 e.Character（不是属性）；
+            //       e.Key 在 IME 输入时不可靠，不要依赖它。
+            Game1.game1.Window.TextInput += OnWindowTextInput;
         }
 
         /// <summary>
@@ -170,6 +171,33 @@ namespace StardewAIAssistant
         {
             _companion.Update();
             _companion.Draw(e.SpriteBatch);
+        }
+
+        /// <summary>
+        /// MonoGame 原生文本输入回调：中文 IME 上屏后每个字符触发一次（英文/符号同理）。
+        /// 只在输入框打开时接收；过滤控制字符——\r \n \b \t 等编辑键不在这里处理，
+        /// 由 OnButtonPressed 的 Enter/Escape/Back 分支负责（双保险，无论 MonoGame
+        /// 是否把编辑键也发成 TextInput 都能正确工作）。
+        /// </summary>
+        private void OnWindowTextInput(object? sender, TextInputEventArgs e)
+        {
+            if (_inputBox.IsOpen && !char.IsControl(e.Character))
+                _inputBox.Append(e.Character);
+        }
+
+        /// <summary>
+        /// HUD 绘制回调：输入框打开时在屏幕底部画一行占位文本（不做美化，能显示就行）。
+        /// 用 Game1.smallFont——中文版游戏的字体图集含汉字；
+        /// 若验证时中文显示为空白/方块，说明字形缺失，需换字体方案（另行调研）。
+        /// </summary>
+        private void OnRenderedHud(object? sender, RenderedHudEventArgs e)
+        {
+            if (!_inputBox.IsOpen)
+                return;
+
+            // 屏幕底部左侧画一行："输入框：<文本>_"（下划线当光标占位）
+            var pos = new Vector2(16f, Game1.uiViewport.Height - 40f);
+            e.SpriteBatch.DrawString(Game1.smallFont, $"输入框：{_inputBox.Text}_", pos, Color.White);
         }
 
         /// <summary>
@@ -247,36 +275,52 @@ namespace StardewAIAssistant
         }
 
         /// <summary>
-        /// F7 按键处理：收集状态、弹“思考中”提示、异步请求 Python 后端。
+        /// 按键事件处理：
+        /// - F7：开关中文输入框；
+        /// - 输入框打开期间：所有按键 Suppress（角色不移动、游戏不响应），
+        ///   Enter 提交（复用聊天框对话流程）、Esc 关闭清空、Back 删除末尾字符。
+        /// 字符输入不在本事件处理——中文 IME 上屏走 Window.TextInput 事件
+        /// （见 OnWindowTextInput，SMAPI 4 没有对应封装）。
         /// </summary>
-        private async void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
+        private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
         {
-            // 只响应 F7 键，其他按键直接忽略
-            if (e.Button != SButton.F7)
-                return;
-
-            // 防御性检查：存档没加载好时（例如停在主菜单），Game1.player 可能为 null，
-            // 此时直接提示并返回，避免空引用异常导致游戏崩溃。
-            if (!Context.IsWorldReady || Game1.player is null || Game1.currentLocation is null)
+            // F7：开关输入框
+            if (e.Button == SButton.F7)
             {
-                Game1.addHUDMessage(new HUDMessage("AI伴侣：请先进入存档后再呼叫我～"));
+                if (_inputBox.IsOpen)
+                    _inputBox.Close();
+                else
+                    _inputBox.Open();
                 return;
             }
 
-            // ========== 【新增】从测试问题池轮流取一个问题 ==========
-            // 先按当前索引取出问题，再让索引 +1 并对数组长度取余，
-            // 这样问到最后一个后会自动回到第 0 个，循环使用。
-            string question = TestQuestions[_questionIndex];
-            _questionIndex = (_questionIndex + 1) % TestQuestions.Length;
+            // 输入框未打开时不干预任何按键，一切照原版走
+            if (!_inputBox.IsOpen)
+                return;
 
-            // 按下 F7 先在 HUD 里显示本次问的内容，方便调试确认轮到了哪个问题
-            Game1.addHUDMessage(new HUDMessage($"玩家问：{question}"));
+            // 打开期间吃掉所有按键：游戏和其他 Mod 都收不到（角色不会移动）
+            Helper.Input.Suppress(e.Button);
 
-            // 走共用核心流程：状态收集 → “思考中” → POST → 解析 → 显示回复 → 异常处理
-            // useChatBox=false 表示回复显示在 HUD（F7 入口）；
-            // 状态收集、思考中提示、POST、解析、4 个 catch 全在 SendToBackendAsync 里，
-            // 改字段/改提示/改超时只需改一处。
-            await SendToBackendAsync(question, useChatBox: false);
+            // 回车：提交。复用聊天框入口（内部有安检，回复显示在原版聊天框浅蓝色）
+            if (e.Button == SButton.Enter)
+            {
+                string question = _inputBox.Text;
+                _inputBox.Close();
+                if (!string.IsNullOrWhiteSpace(question))
+                    HandleAiChatQuestion(question);
+                return;
+            }
+
+            // Esc：关闭并清空（下一帧起角色恢复移动）
+            if (e.Button == SButton.Escape)
+            {
+                _inputBox.Close();
+                return;
+            }
+
+            // Backspace：删除末尾字符
+            if (e.Button == SButton.Back)
+                _inputBox.Backspace();
         }
 
         /// <summary>
@@ -367,14 +411,23 @@ namespace StardewAIAssistant
                 IsRaining = Game1.isRaining,
                 DayOfMonth = Game1.dayOfMonth,
                 Money = Game1.player.Money,
-                Health = Game1.player.health
+                Health = Game1.player.health,
+
+                // ========== 【扩展状态感知】第二批新增字段 ==========
+                // 当前手持工具名（游戏内原名，如 "Axe"/"Pickaxe"），空手时为空字符串；
+                // 中文翻译交给 Python 端统一处理
+                CurrentTool = Game1.player.CurrentTool?.Name ?? "",
+                FarmingLevel = Game1.player.farmingLevel.Value,     // 耕种技能等级（0-10）
+                MiningLevel = Game1.player.miningLevel.Value,       // 采矿技能等级（0-10）
+                DaysPlayed = (int)Game1.stats.DaysPlayed            // 存档已玩总天数（uint → int）
             };
 
             // 入口标记，方便在 SMAPI 日志里区分是 F7 还是聊天框触发的
             string entryTag = useChatBox ? "聊天框" : "F7";
             this.Monitor.Log(
                 $"[AI伴侣] [{entryTag}] 收集状态：玩家={state.PlayerName}，体力={state.Stamina}，时间={state.GameTime}，地点={state.Location}，" +
-                $"季节={state.Season}，下雨={state.IsRaining}，日期={state.DayOfMonth}号，金币={state.Money}，血量={state.Health}",
+                $"季节={state.Season}，下雨={state.IsRaining}，日期={state.DayOfMonth}号，金币={state.Money}，血量={state.Health}，" +
+                $"工具={state.CurrentTool}，耕种Lv={state.FarmingLevel}，采矿Lv={state.MiningLevel}，已玩天数={state.DaysPlayed}",
                 LogLevel.Info);
             this.Monitor.Log($"[AI伴侣] [{entryTag}] 问题内容：{question}", LogLevel.Info);
 
@@ -566,6 +619,19 @@ namespace StardewAIAssistant
 
             /// <summary>玩家当前血量。</summary>
             public int Health { get; set; }
+
+            // ========== 【扩展状态感知】第二批新增字段 ==========
+            /// <summary>当前手持工具名（游戏内原名，如 "Axe"/"Pickaxe"），空手时为空字符串。</summary>
+            public string CurrentTool { get; set; } = string.Empty;
+
+            /// <summary>耕种技能等级（0-10）。</summary>
+            public int FarmingLevel { get; set; }
+
+            /// <summary>采矿技能等级（0-10）。</summary>
+            public int MiningLevel { get; set; }
+
+            /// <summary>存档已玩总天数（用于"第 N 天"的进度表述）。</summary>
+            public int DaysPlayed { get; set; }
         }
 
         /// <summary>

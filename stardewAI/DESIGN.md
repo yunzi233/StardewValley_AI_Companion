@@ -87,9 +87,11 @@ C# 收到 {reply, emotion}
 - [x] RAG 知识库（ChromaDB + bge-m3，已收录作物 / 鱼类 / NPC 礼物）
 - [x] 状态感知（基础字段：名字 / 体力 / 时间 / 地点）
 - [x] 扩展状态感知（第一批：季节 / 是否下雨 / 日期 / 金币 / 血量，C# 收集 + Python 提示词注入）
-- [x] 游戏内自由提问（原版聊天框 + Harmony 拦截 `AI ` 前缀，回复进聊天框；F7 保留测试入口）
+- [x] 扩展状态感知（第二批 a，2026-10-14）：当前工具 / 耕种 / 采矿等级 / 存档天数（C# 收集 → Python 状态块，工具名英文→中文映射，空手不显示）
+- [x] 游戏内自由提问（原版聊天框 + Harmony 拦截 `AI ` 前缀，回复进聊天框；v0.9 另有 F7 中文输入框）
+- [x] 中文 IME 输入框（v0.9，2026-10-14）：F7 开关，直连 MonoGame `GameWindow.TextInput` 接收 IME 上屏字符（SMAPI 4 无封装，见 NOTES 踩坑 23）；打开期间按键全接管防误操作，回车复用聊天框回复链路
 - [x] BYOK 基础（config.json + LLM 工厂：ollama / deepseek / zhipu / qwen / kimi）
-- [ ] 扩展状态感知（第二批：背包 / 当前工具 / NPC 好感度 / 当日任务；季节天气参与检索 query）
+- [ ] 扩展状态感知（第二批 b：背包 / NPC 好感度 / 当日任务；季节天气参与检索 query）
 - [x] 多轮记忆（LangGraph + AsyncSqliteSaver：retrieve → chat 对话图，历史按玩家名隔离并落盘 SQLite，重启不丢；2026-10-13）
 - [x] 浮动精灵（第一版，2026-10-14）：`RenderedWorld` 事件绘制，跟随玩家 + sin 浮动；`ModContent.Load` 加载 `assets/robot.png`（64x64）按图片实际尺寸 1:1 绘制，贴图缺失回退方块占位
 - [ ] 主动提醒

@@ -14,6 +14,8 @@ stardewAI/**/*.zip
 stardewAI/.inspect/
 # GMCM 前置 dll 由玩家自行从 GMCM 发布页提取，不入库（libs/ 下的 .cs 接口文件仍入库）
 stardewAI/ModTemplate/libs/*.dll
+# 美术工作目录：源素材草稿，最终素材已复制进 ModTemplate/assets/ 随仓库分发
+stardewAI/draw/
 
 # ===== 通用 =====
 .vs/

@@ -1,4 +1,5 @@
 import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -11,7 +12,20 @@ from aipy.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, OLLAMA_BAS
 from aipy.llm_factory import load_config, create_llm, save_config
 from aipy.agent.graph import init_agent, build_graph
 
-app = FastAPI(title="Stardew AI Companion")
+# graph 在 lifespan（async 上下文）里构建：langgraph-checkpoint-sqlite 3.x 的
+# AsyncSqliteSaver.__init__ 内部会调用 asyncio.get_running_loop()，
+# 在模块顶层同步调用 build_graph() 没有事件循环，会直接抛 RuntimeError。
+graph = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global graph
+    graph = build_graph()
+    yield
+
+
+app = FastAPI(title="Stardew AI Companion", lifespan=lifespan)
 
 # ========== 系统提示词 ==========
 SYSTEM_PROMPT = """你是一个星露谷物语里的 AI 伴侣，陪玩家一起冒险。
@@ -60,6 +74,7 @@ class ConfigRequest(BaseModel):
     provider: str
     api_key: str = ""
     model: str
+    temperature: float = 0.7  # 生成随机度（0.0-2.0），C# 老版本推送不带此字段时用默认值
 
 
 # ========== 占位 LLM（未配置时启动用）==========
@@ -94,9 +109,10 @@ except Exception as e:
     print(f"[LLM] 未配置（{type(e).__name__}: {e}），等待游戏内配置推送...")
     llm = PlaceholderLLM()
 
-# ========== 初始化 LangGraph 对话图 ==========
+# ========== 初始化对话依赖 ==========
+# 注：graph 本体已在 lifespan（async 上下文）里构建（AsyncSqliteSaver 需要 running loop），
+# 这里只注入 llm / retriever / system_prompt
 init_agent(llm=llm, retriever=retriever, system_prompt=SYSTEM_PROMPT)
-graph = build_graph()
 
 # ========== 接口 ==========
 @app.post("/chat", response_model=ChatResponse)
@@ -164,13 +180,25 @@ async def update_config(cfg: ConfigRequest):
         raise HTTPException(400, f"provider={cfg.provider} 时必须填 api_key")
     if not cfg.model.strip():
         raise HTTPException(400, "model 不能为空")
+    if not (0.0 <= cfg.temperature <= 2.0):
+        raise HTTPException(400, "temperature 必须在 0.0 到 2.0 之间")
 
-    # 2. 写文件
-    save_config({"provider": cfg.provider, "api_key": cfg.api_key, "model": cfg.model})
+    # 2. 写文件（temperature 一起落盘，下次启动直接生效）
+    save_config({
+        "provider": cfg.provider,
+        "api_key": cfg.api_key,
+        "model": cfg.model,
+        "temperature": cfg.temperature,
+    })
 
     # 3. 重建 LLM
     try:
-        new_llm = create_llm({"provider": cfg.provider, "api_key": cfg.api_key, "model": cfg.model})
+        new_llm = create_llm({
+            "provider": cfg.provider,
+            "api_key": cfg.api_key,
+            "model": cfg.model,
+            "temperature": cfg.temperature,
+        })
     except Exception as e:
         print(f"[错误] 重建 LLM 失败：\n{traceback.format_exc()}")
         raise HTTPException(400, f"配置无效，LLM 创建失败：{e}")
@@ -180,5 +208,5 @@ async def update_config(cfg: ConfigRequest):
     llm = new_llm
     init_agent(llm=new_llm, retriever=retriever, system_prompt=SYSTEM_PROMPT)
 
-    print(f"[LLM] 已切换为 provider={cfg.provider}, model={cfg.model}")
-    return {"status": "ok", "provider": cfg.provider, "model": cfg.model}
+    print(f"[LLM] 已切换为 provider={cfg.provider}, model={cfg.model}, temperature={cfg.temperature}")
+    return {"status": "ok", "provider": cfg.provider, "model": cfg.model, "temperature": cfg.temperature}

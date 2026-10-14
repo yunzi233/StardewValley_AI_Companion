@@ -180,6 +180,19 @@ namespace StardewAIAssistant
                     tooltip: () => "如 deepseek-chat / qwen-plus / glm-4-flash / qwen2.5:3b"
                 );
 
+                // 回答温度：GMCM 接口文件里没有 AddSlider，float 用 AddNumberOption
+                // （游戏中表现为 +/- 数值调节），min/max/interval 为可空参数
+                gmcm.AddNumberOption(
+                    this.ModManifest,
+                    getValue: () => _config.Temperature,
+                    setValue: v => _config.Temperature = v,
+                    name: () => "回答温度",
+                    tooltip: () => "0.0-2.0，越高越有创意但越容易胡说。推荐 0.5-0.9",
+                    min: 0f,
+                    max: 2f,
+                    interval: 0.1f
+                );
+
                 Monitor.Log("已注册 GenericModConfigMenu 配置界面", LogLevel.Info);
             }
             catch (Exception ex)
@@ -457,7 +470,8 @@ namespace StardewAIAssistant
                 {
                     provider = cfg.Provider,
                     api_key = cfg.ApiKey,
-                    model = cfg.Model
+                    model = cfg.Model,
+                    temperature = cfg.Temperature  // 回答温度（0.0-2.0），对齐后端 ConfigRequest
                 };
 
                 string json = JsonSerializer.Serialize(payload);
@@ -468,7 +482,7 @@ namespace StardewAIAssistant
                 response.EnsureSuccessStatusCode();
 
                 Game1.addHUDMessage(new HUDMessage("AI伴侣：配置已推送到后端"));
-                Monitor.Log($"配置已推送：provider={cfg.Provider}, model={cfg.Model}", LogLevel.Debug);
+                Monitor.Log($"配置已推送：provider={cfg.Provider}, model={cfg.Model}, temperature={cfg.Temperature}", LogLevel.Debug);
             }
             catch (Exception ex)
             {

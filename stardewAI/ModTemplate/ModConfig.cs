@@ -11,5 +11,8 @@ namespace StardewAIAssistant
 
         /// <summary>模型名，如 deepseek-chat / qwen-plus / glm-4-flash / qwen2.5:3b</summary>
         public string Model { get; set; } = "deepseek-chat";
+
+        /// <summary>回答温度 0.0-2.0：越高越有创意但越容易胡说，推荐 0.5-0.9</summary>
+        public float Temperature { get; set; } = 0.7f;
     }
 }

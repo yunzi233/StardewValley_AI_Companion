@@ -22,11 +22,11 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 - 游戏状态感知：名字 / 体力 / 血量 / 游戏时间 / 日期（1-28）/ 季节 / 是否下雨 / 地点 / 金币
 - LLM 配置化（BYOK 基础）：`config.json` 切换 provider——本地 `ollama`（免 Key）或云端 `deepseek` / `zhipu` / `qwen` / `kimi`（OpenAI 兼容接口，自带 Key）
 - 多轮对话记忆（LangGraph + SQLite 持久化）：AI 记得本次会话聊过的内容，按玩家名隔离历史，**重启后端也不丢**；上下文窗口只带最近 10 轮（完整历史仍存 SQLite，不丢数据）
+- 模型参数可配置：回答温度（temperature）在 GMCM 里调节（0.0-2.0，步长 0.1），随配置推送后端实时生效
 
 **⏳ 规划中：**
 - 浮动精灵 + 主动提醒
 - 继续扩展状态（背包 / 当前工具 / NPC 好感 / 当日任务）
-- 游戏内配置界面（当前需手动编辑 config.json）；模型参数（temperature）可配置
 
 ## 架构
 
@@ -62,7 +62,7 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 **关键设计**：
 - **双入口复用同一套后端流程**：聊天框提问经 Harmony 补丁（`ChatBox.textBoxEnter(string)` 的 Prefix）截获，`"AI "` 前缀才拦截，其他消息原样放行；F7 测试问题池逻辑独立保留
 - **LLM 工厂模式**：[llm_factory.py](AIpy/src/aipy/llm_factory.py) 启动时读 `config.json`，按 `provider` 创建 `ChatOllama` 或 `ChatOpenAI`（四个云端厂商的 base_url 已内置预设）；嵌入模型始终用本地 Ollama 的 bge-m3，与对话模型选型无关
-- **游戏内配置（GMCM）**：玩家 ESC → Mod 选项 → 填厂商/Key/模型 → 保存时 C# 推送到后端 `POST /config` → 写 `config.json` + 重建 LLM 注入对话图，无需重启；后端未启动时配置只存本地 ModConfig.json，启动后需重新保存
+- **游戏内配置（GMCM）**：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# 推送到后端 `POST /config` → 写 `config.json` + 重建 LLM 注入对话图，无需重启；后端未启动时配置只存本地 ModConfig.json，启动后需重新保存
 - `await` 之后的代码运行在线程池后台线程，所有 UI 操作（HUD / 聊天框）通过主线程任务队列（`Queue<Action>` + `UpdateTicked`）调度回游戏主线程执行，避免随机崩溃
 - 全局复用单个 `HttpClient`，15 秒超时，请求期间游戏照常运行不卡顿
 - 向量库在后端启动时只加载一次；每次请求先做向量检索（top-3），把参考资料片段和游戏状态一起注入提示词
@@ -130,6 +130,56 @@ AI_Projects/
 | 对话模型（二选一） | **本地模式**：[Ollama](https://ollama.com/)（默认端口 11434）+ `qwen2.5:3b`；**云端模式**：DeepSeek / 智谱 / 通义 / Kimi 任一厂商的 API Key |
 | 嵌入模型（必需本地） | Ollama 的 `bge-m3`——无论对话用本地还是云端，知识库向量化都走本地 Ollama，必须 `ollama pull bge-m3` |
 
+### 首次运行前置准备
+
+1. **Python 环境**：装 Python 3.11+ 和 [uv](https://docs.astral.sh/uv/)
+2. **游戏 Mod 环境**：装 SMAPI 4.x + [GenericModConfigMenu](https://www.nexusmods.com/stardewvalley/mods/5098)
+3. **通用嵌入服务**：装 [Ollama](https://ollama.com)，拉取嵌入模型
+   ```bash
+   ollama pull bge-m3
+   ```
+   （嵌入模型固定走本地 Ollama，与对话模型的选型无关）
+4. **GMCM 前置 dll**：把 `GenericModConfigMenu.dll` 复制到 `stardewAI/ModTemplate/libs/`（详见下文"编译并部署 Mod"）
+5. **构建知识库**：
+   ```bash
+   cd AIpy
+   uv run python src/aipy/build_knowledge_base.py
+   ```
+
+## 配置文件说明
+
+项目涉及 **两个配置文件**，**两份都包含明文 API Key，都不应提交到 Git**：
+
+| 文件 | 位置 | 用途 | 谁写 |
+|---|---|---|---|
+| `ModConfig.json` | `Mods/StardewAIAssistant/`（游戏侧） | 游戏读取，决定推送给后端的配置 | GMCM 保存时自动写入 |
+| `config.json` | `AIpy/src/aipy/`（后端侧） | 后端读取，决定用哪个 LLM | 后端收到推送后自动写入 |
+
+**首次配置流程**：
+1. 启动 Python 后端（`uv run uvicorn main:app --reload --port 8000`）
+2. 启动游戏，ESC → 配置 MOD → Stardew AI Assistant
+3. 填入 Provider / API Key / Model / Temperature，点保存
+4. 两个配置文件会自动生成，之后无需再填
+
+**如果你没装 GMCM**，可以手动创建 `Mods/StardewAIAssistant/ModConfig.json`：
+```json
+{
+  "Provider": "deepseek",
+  "ApiKey": "sk-你的密钥",
+  "Model": "deepseek-chat"
+}
+```
+
+支持的 Provider 与推荐模型：
+
+| Provider | 推荐模型 | 获取 Key |
+|---|---|---|
+| `deepseek` | `deepseek-chat` | `https://platform.deepseek.com` |
+| `qwen` | `qwen-plus` | `https://dashscope.console.aliyun.com` |
+| `zhipu` | `glm-4-flash` | `https://open.bigmodel.cn` |
+| `kimi` | `moonshot-v1-8k` | `https://platform.moonshot.cn` |
+| `ollama` | 本地模型（如 `qwen2.5:3b`） | 需先装 [Ollama](https://ollama.com) |
+
 ## 快速开始
 
 ### 1. 准备本地 Ollama
@@ -138,7 +188,7 @@ AI_Projects/
 
 ```bash
 ollama pull bge-m3       # 嵌入模型（必做，知识库向量化用）
-ollama pull qwen2.5:3b   # 对话模型（仅本地模式需要）
+ollama pull 本地模型   # 对话模型（仅本地模式需要）
 ```
 
 Ollama 安装后一般会自动在后台运行（默认端口 `11434`）；若没有，手动执行 `ollama serve`。
@@ -171,10 +221,11 @@ uv run python src/aipy/build_knowledge_base.py
 **方式一（推荐）：游戏内 GMCM 配置**
 1. 安装 [GenericModConfigMenu](https://www.nexusmods.com/stardewvalley/mods/5098)（可选，但推荐）
 2. 启动游戏 → ESC → 选项 → 往下找到 "Mod 选项" → Stardew AI Assistant
-3. 填三项：
+3. 填四项：
    - **AI 厂商**：`deepseek` / `qwen` / `zhipu` / `kimi` / `ollama`
    - **API Key**：云端必填，本地 Ollama 留空
    - **模型名**：如 `deepseek-chat` / `qwen-plus` / `glm-4-flash` / `qwen2.5:3b`
+   - **回答温度**：0.0-2.0（步长 0.1），越高越有创意但越容易胡说，推荐 0.5-0.9
 4. 保存 → C# 自动推送到后端 `POST /config` → 写 `config.json` + 重建 LLM，**无需重启后端**
 5. 后端未启动时保存：配置只写本地 `ModConfig.json`，HUD 提示"后端未启动，配置已保存到本地；启动后端后请重新保存"
 
@@ -297,12 +348,12 @@ dotnet build
 **请求**（snake_case，与后端 config.json 对齐）：
 
 ```json
-{ "provider": "deepseek", "api_key": "sk-xxx", "model": "deepseek-chat" }
+{ "provider": "deepseek", "api_key": "sk-xxx", "model": "deepseek-chat", "temperature": 0.7 }
 ```
 
 - `provider` 白名单：`ollama` / `deepseek` / `zhipu` / `qwen` / `kimi`，其他值返回 400
-- `provider != ollama` 时 `api_key` 必填，`model` 必填；校验失败返回 400 + 错误详情
-- 成功：写 `src/aipy/config.json` → 重建 LLM → 重新注入对话图，返回 `{"status": "ok"}`；**对话历史（SQLite）保留，不重建 graph**
+- `provider != ollama` 时 `api_key` 必填，`model` 必填；`temperature` 必须在 0.0-2.0；校验失败返回 400 + 错误详情
+- 成功：写 `src/aipy/config.json` → 重建 LLM → 重新注入对话图，返回 `{"status": "ok", "provider": ..., "model": ..., "temperature": ...}`；**对话历史（SQLite）保留，不重建 graph**
 - C# 端 GMCM 保存时自动推送；后端未启动时 C# 只写本地 `ModConfig.json`
 
 注意事项：
@@ -317,7 +368,7 @@ dotnet build
 - [x] 游戏内自由提问：借原版聊天框实现（按 T → `AI 问题` → Harmony 拦截），绕开了自研输入框的中文 IME 难题；回复进聊天框可翻历史
 - [x] LLM provider / 模型可配置：`config.json` + LLM 工厂，支持 ollama / deepseek / zhipu / qwen / kimi（BYOK 基础）
 - [x] 游戏内配置界面（GMCM，2026-10-14）：ESC → Mod 选项 → 填厂商/Key/模型 → 保存推送后端 `POST /config`，写文件 + 重建 LLM，无需重启；无 GMCM 时可手动编辑 `src/aipy/config.json`
-- [ ] 模型参数可配置化（`temperature=0.7` 仍写死；检索 top-k 已挪进 `aipy/config.py`）
+- [x] 模型参数可配置化（2026-10-14）：temperature 全链路打通——GMCM 数值选项 → `POST /config`（校验 0.0-2.0）→ 写 config.json → 重建 LLM 实时生效；检索 top-k 已挪进 `aipy/config.py`
 - [ ] 漂浮机器人：贴图渲染、跟随玩家移动、待机动画
 - [ ] 防连点：思考中重复提问应忽略或排队
 - [ ] 扩充状态感知（第二批）：背包、当前工具、NPC 好感、当日任务；并让季节/天气参与检索 query
@@ -329,9 +380,9 @@ dotnet build
 
 | 现象 | 原因与解决 |
 |---|---|
-| 启动后端报 `缺少配置文件 .../config.json` | 还没创建配置：`cp config.example.json src/aipy/config.json` 再编辑；⚠️ 必须放在 `src/aipy/` 下（与 llm_factory.py 同目录），放项目根目录不生效；**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位，回复提示去游戏里配置） |
+| 后端启动日志显示 `[LLM] 未配置...` | 正常现象——等你在游戏里 GMCM 配置完会自动切换；或手动 `cp config.example.json src/aipy/config.json` 后重启（⚠️ 必须放在 `src/aipy/` 下，放项目根目录不生效） |
 | 云端模式报 401 / 认证失败 | API Key 没填、填错或欠费；检查 `src/aipy/config.json` 的 `api_key` 与 `model` 名称；或检查 GMCM 里填的 Key 是否含空格 |
-| 改了 config.json 没反应 | 配置只在后端**启动时读取一次**，改完必须重启 uvicorn |
+| 手动改了 config.json 没反应 | 手动改的配置只在后端启动时读取。**推荐用游戏内 GMCM 保存**（走 `/config` 接口热更新，无需重启） |
 | AI 回复驴唇不对马嘴 / 像串了别人的对话 | 多轮记忆按玩家名（thread_id）隔离：改了角色名 = 新会话；测试残留的旧历史会一直保留，想让 AI"失忆"就删 `AIpy/data/checkpoints.db` 后重启后端 |
 | `uv uvicorn` 报 `unrecognized subcommand` | 少了 `run`，正确命令是 `uv run uvicorn main:app --port 8000` |
 | 输入 `AI 问题` 被当成普通聊天发出去 | Harmony 补丁未生效：看 SMAPI 启动日志有无补丁加载记录；确认 `dotnet build` 后 Mods 目录 DLL 已更新 |
@@ -348,6 +399,25 @@ dotnet build
 
 更多踩坑细节（反射查 API、沙箱限制、C# 与 C++ 差异等）见 [stardewAI/NOTES.md](stardewAI/NOTES.md)。
 
-## 许可证
+## 开源协议
 
-待定（TBD）
+本项目采用 **分部分授权**：
+
+| 部分 | 协议 | 说明 |
+|---|---|---|
+| 源代码（C# / Python） | **MIT** | 可自由使用、修改、分发 |
+| `AIpy/wiki_data/` 下的知识库数据 | **CC BY-NC-SA 4.0** | 来源于星露谷 Wiki，遵循原协议 |
+| 引用的第三方库 | 各自原协议 | 见 `THIRD_PARTY_LICENSES.txt` |
+
+**简单说**：你可以随便用、改、分享这个项目的代码，但不能把基于 wiki 数据的功能用于商业用途。
+
+## 数据来源与致谢
+
+- **知识库数据**：来自 [星露谷物语 Wiki](https://stardewvalleywiki.com/)（中文/英文），
+  遵循 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 协议。
+  本项目仅提取事实性数据（作物价格、鱼的出现条件、NPC 礼物偏好等），
+  并对原始描述进行了格式重写。原始版权归 Wiki 贡献者所有。
+- **SMAPI**：由 [Pathoschild](https://github.com/Pathoschild/SMAPI) 开发
+- **GenericModConfigMenu**：由 [spacechase0](https://github.com/spacechase0/StardewValleyMods) 开发
+- **bge-m3 嵌入模型**：由 BAAI 发布，MIT 协议
+- **LangChain / LangGraph / FastAPI / ChromaDB**：各自官方团队开发，MIT 协议

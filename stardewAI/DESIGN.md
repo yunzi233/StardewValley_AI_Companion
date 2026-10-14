@@ -72,12 +72,12 @@ C# 收到 {reply, emotion}
 - **local（本地模式）**：`provider: "ollama"`，免 Key；玩家自己装 Ollama + 拉 `qwen2.5:3b`；`base_url` 可改（默认本机 11434）
 - **cloud（云端模式）**：`provider` 选 `deepseek` / `zhipu` / `qwen` / `kimi`，填自己的 `api_key` 和 `model`；四家 base_url 已在工厂里预设，全部走 OpenAI 兼容接口
 - 注意：无论哪种对话模式，**嵌入模型 bge-m3 始终走本地 Ollama**，所以 Ollama 仍是必装项
-- config.json 含密钥，已 gitignore；启动时读取一次，改配置需重启后端
+- config.json 含密钥，已 gitignore；启动时读取一次，游戏内 GMCM 保存可热更新（走 POST /config，无需重启）
 
 待完善：
 
-- [ ] 游戏内/启动器配置界面（当前要手动编辑 JSON）
-- [ ] temperature / top-k 等参数可配置（top-k 已挪进 `aipy/config.py`，2026-10-12；temperature 仍写死 0.7，待挪进 config.json）
+- [x] 游戏内配置界面（GMCM，2026-10-13）：厂商/Key/模型/温度四项，保存即推送后端热更新；启动器配置不做
+- [x] temperature 可配置（2026-10-14）：GMCM 数值选项 → `POST /config`（校验 0.0-2.0）→ config.json → `create_llm`，实时生效；top-k 已挪进 `aipy/config.py`（2026-10-12）
 - [ ] 配置校验与错误提示再细化（模型名写错、额度不足等）
 
 ## 当前进度

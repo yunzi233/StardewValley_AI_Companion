@@ -36,12 +36,15 @@ def save_config(cfg: dict) -> None:
 
 def create_llm(cfg: dict):
     provider = cfg.get("provider", "ollama")
+    # temperature 默认 0.7；越大回答越随机，越小越稳定（范围 0.0-2.0）。
+    # 老的 config.json 没有该字段时自动回落到默认值，向后兼容。
+    temperature = float(cfg.get("temperature", 0.7))
 
     if provider == "ollama":
         return ChatOllama(
             model=cfg.get("model", "qwen2.5:3b"),
             base_url=cfg.get("base_url", "http://127.0.0.1:11434"),
-            temperature=0.7,
+            temperature=temperature,  # 可配置；原来是硬编码 0.7
         )
 
     if provider not in PROVIDERS:
@@ -55,5 +58,5 @@ def create_llm(cfg: dict):
         model=cfg["model"],
         api_key=api_key,
         base_url=PROVIDERS[provider],
-        temperature=0.7,
+        temperature=temperature,  # 可配置；原来是硬编码 0.7
     )

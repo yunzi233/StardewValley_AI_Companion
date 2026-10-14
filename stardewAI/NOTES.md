@@ -103,6 +103,11 @@
     - 原因：GMCM 的 GitHub 仓库里 `framework/` 目录下的 API 文件是**内部开发版**，跟着作者进度频繁变动；而 `shared/SpaceShared.Mods/APIs/` 才是作者专门维护给**外部 Mod** 的稳定接口。用了 framework/ 版本会导致方法签名不匹配。
     - 解决：从 GMCM 仓库的 `shared/` 路径拿 `IGenericModConfigMenuApi.cs`；下载时如果 raw.githubusercontent.com 被墙，优先走 `ghproxy.com` 镜像。
 
+21. **langgraph-checkpoint-sqlite 3.x：AsyncSqliteSaver 必须在 async 上下文里构造**
+    - 现象：某次 `uv sync` 后后端启动直接炸：`RuntimeError: no running event loop`（aio.py 的 `AsyncSqliteSaver.__init__` 里调 `asyncio.get_running_loop()`）。
+    - 原因：3.x 的构造函数要求有 running event loop，而 main.py 是模块顶层同步调 `build_graph()`，此时还没有事件循环；老版本没这个要求，升级即回归。
+    - 解决：graph 构建挪进 FastAPI lifespan（`@asynccontextmanager`，startup 阶段在 async 上下文里 `build_graph()`）；顶层只留 `init_agent()` 注入依赖。教训：依赖升级后启动失败，先怀疑第三方包的构造时序变化。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -143,7 +148,7 @@
 8. **Mod 间 API 调用（GMCM 集成）**
    - 时序：Entry 执行时其他 Mod 可能还没初始化完，此时 `GetApi` 会返回 null 并触发 SMAPI 警告 `Tried to access a mod-provided API before all mods were initialized.`——必须订阅 `GameLaunched` 事件再调。
    - 获取：`helper.ModRegistry.GetApi<IGenericModConfigMenuApi>("spacechase0.GenericModConfigMenu")`，返回 null 表示玩家没装 GMCM，跳过注册即可。
-   - 注册：`Register` + `AddTextOption` 三连；save 回调是同步 `Action`，里面要 fire-and-forget 异步推送（`_ = PushConfigToBackendAsync(...)`）。
+   - 注册：`Register` + `AddTextOption` 三连 + `AddNumberOption`（数值参数如 temperature 用它，min/max/interval 是 `float?` 可空参数）；save 回调是同步 `Action`，里面要 fire-and-forget 异步推送（`_ = PushConfigToBackendAsync(...)`）。
    - 接口文件：必须用 GMCM 仓库 `shared/` 目录下的版本，framework/ 是内部开发版（见踩坑 20）。
 
 ## 三、代码地图
@@ -162,7 +167,7 @@
 | `ModEntry`（类） | L30 | Mod 入口，继承 SMAPI 的 `Mod` |
 | `Entry` | L96-121 | 启动时跑一次：单例保存 → `ReadConfig<ModConfig>()` → `Harmony.PatchAll()` → 订阅 ButtonPressed/UpdateTicked/GameLaunched |
 | `OnGameLaunched` | L126-129 | GameLaunched 事件处理：调 RegisterGmcmConfig |
-| `RegisterGmcmConfig` | L136-190 | GetApi → Register + AddTextOption×3；save 回调写 JSON + fire-and-forget 推送后端；try-catch 兜底 |
+| `RegisterGmcmConfig` | L136-203 | GetApi → Register + AddTextOption×3 + AddNumberOption（回答温度 0.0-2.0 步长 0.1）；save 回调写 JSON + fire-and-forget 推送后端；try-catch 兜底 |
 | `OnButtonPressed` | L192 | F7 入口（精简后只管：F7 过滤→安检→取测试问题→显示"玩家问"HUD→调 `SendToBackendAsync(useChatBox:false)`） |
 | `OnUpdateTicked` | L147 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
 | `EnqueueHudMessage` | L175 | 把显示 HUD 的动作打包入队（可在后台线程调） |
@@ -171,7 +176,7 @@
 | `HandleAiChatQuestion` | L329 | 聊天框入口（精简后只管：安检→调 `SendToBackendAsync(useChatBox:true)`） |
 | `EnqueueChatMessage` | L349 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
 | `EnqueueChatMessageFromPatch` | L362 | internal 包装，供补丁类调用用法提示 |
-| `PushConfigToBackendAsync` | L370-402 | GMCM save 回调 fire-and-forget：POST /config 推送到后端；成功 HUD 提示，失败 HUD+日志 |
+| `PushConfigToBackendAsync` | L464-493 | GMCM save 回调 fire-and-forget：POST /config 推送 provider/api_key/model/temperature 到后端；成功 HUD 提示，失败 HUD+日志 |
 | `GameStateData`（内部类） | L408 | 发给后端的模型共 10 字段：基础 PlayerName/Stamina/GameTime/Location/Message + 扩展 Season/IsRaining/DayOfMonth/Money/Health |
 | `ChatResponse`（内部类） | L439 | 后端返回模型：Reply/Emotion |
 
@@ -182,6 +187,7 @@
 | `Provider` | L7 | AI 厂商：deepseek / qwen / zhipu / kimi / ollama，默认 deepseek |
 | `ApiKey` | L10 | 云端厂商 API Key；本地 Ollama 留空 |
 | `Model` | L13 | 模型名，默认 deepseek-chat |
+| `Temperature` | L16 | 回答温度 0.0-2.0（默认 0.7），GMCM 数值选项 |
 
 ### C# 端：`ModTemplate/ChatBoxTextBoxEnterPatch.cs`（Harmony 补丁）
 
@@ -199,7 +205,9 @@
 | `ChatRequest` / `ChatResponse` / `ConfigRequest` | L40-51 / L54-56 / L59-62 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health）；ConfigRequest 供 GMCM 推送 |
 | `PlaceholderLLM` | L65-73 | 未配置时占位，ainvoke 返回固定提示 |
 | 向量库初始化 | L75-84 | 模块级只跑一次：从 `aipy.config` 读常量 → `OllamaEmbeddings` + `Chroma` → `retriever`（k=`TOP_K`） |
-| LLM 创建 + 图构建 | L86-99 | try-except：`load_config()` → `create_llm()` 工厂创建，失败用 PlaceholderLLM；`init_agent()` 注入 llm/retriever/system_prompt → `graph = build_graph()` |
+| lifespan | L21-25 | async 上下文里 `build_graph()`——AsyncSqliteSaver 3.x 构造时要 running loop（见踩坑 21）；顶层 `graph = None` |
+| LLM 创建 | L104-110 | try-except：`load_config()` → `create_llm()` 工厂创建，失败用 PlaceholderLLM 占位 |
+| 依赖注入 | L115 | `init_agent()` 注入 llm/retriever/system_prompt（graph 已在 lifespan 构建好） |
 | `chat_endpoint` | L101-155 | `/chat` 主流程（检索/拼提示词/调 LLM 已下沉到图节点）：①`thread_id=玩家名`（记忆按角色隔离）②组 `player_state` dict（9 字段）③`graph.ainvoke`（try 包裹，异常返回友好错误）④按 `result["error"]` 分支返回 retrieval_failed / llm_failed 提示 ⑤成功取 `messages[-1].content` 作回复 |
 | `update_config` | L157-184 | `/config` 主流程：校验 provider/api_key/model → `save_config` 写文件 → `create_llm` 重建 → 重新 `init_agent`（不重建 graph，历史保留） |
 
@@ -229,7 +237,7 @@
 | `CONFIG_PATH` | L16 | `Path(__file__).parent/"config.json"` → 真实配置在 `src/aipy/` 下（不是项目根） |
 | `load_config` | L19-25 | config.json 不存在直接抛 FileNotFoundError 并提示复制 example |
 | `save_config` | L28-34 | 覆盖写 config.json（UTF-8，缩进 2），供 /config 接口调用 |
-| `create_llm` | L37-59 | `ollama` → `ChatOllama(model, base_url)`；其他 provider 校验 api_key 非空后返回 `ChatOpenAI(model, api_key, base_url=预设)`；temperature 两边都写死 0.7 |
+| `create_llm` | L37-62 | `ollama` → `ChatOllama(model, base_url, temperature)`；其他 provider 校验 api_key 非空后返回 `ChatOpenAI(model, api_key, base_url=预设, temperature)`；temperature 读 cfg（默认 0.7，老 config.json 无此字段时兼容） |
 
 ### Python 端：`AIpy/src/aipy/config.py`（项目级常量，新建）
 
@@ -275,7 +283,7 @@
 - [x] 记忆持久化（2026-10-13）：MemorySaver 换 AsyncSqliteSaver，历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢（同步版 SqliteSaver 不支持 async，见踩坑 19）。
 - [x] 历史长度上限（2026-10-13）：chat_node 只把最近 20 条（`[-21:-1]`，约 10 轮）塞给 LLM，更早历史仍完整留在 SQLite；token 成本可控且不丢数据。
 - [x] 游戏内配置界面（GMCM，2026-10-14）：C# 端 `ModConfig.cs` + `RegisterGmcmConfig`（GameLaunched 事件），Python 端 `POST /config` + `save_config` + `PlaceholderLLM`；配置改完无需重启后端，对话历史保留。
-- [ ] 模型参数可配置：检索 top-k 已挪进 `aipy/config.py`（2026-10-12）；`temperature=0.7` 仍在 `llm_factory.py` 两处写死，待挪进 config.json；配置改完目前要重启后端。
+- [x] 模型参数可配置（2026-10-14）：temperature 全链路打通——C# `ModConfig.Temperature` + GMCM `AddNumberOption`（0.0-2.0 步长 0.1）→ `POST /config`（校验 0.0-2.0）→ `save_config` 落盘 → `create_llm` 读 cfg 重建 LLM 实时生效；检索 top-k 已挪进 `aipy/config.py`（2026-10-12）。
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
 - [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键。
 - [ ] emotion 现在固定 happy 只打日志（失败时返回 error），后面接表情/立绘显示。
@@ -285,8 +293,8 @@
 
 - Python 后端目录：`D:\AI_Projects\AIpy`（与本 Mod 同一个根仓库），入口 `main.py`，FastAPI + uvicorn，uv 管理依赖，Python >=3.11。
 - Ollama 模型：嵌入固定用 `bge-m3`（必装，RAG 向量化）；对话模型本地模式用 `qwen2.5:3b`，云端模式不需要本地对话模型，两个模型都要先 `ollama pull`。
-- LLM 配置：真实配置文件是 `AIpy/src/aipy/config.json`（⚠️ 不在项目根），模板 `AIpy/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启。
-- 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
+- LLM 配置：真实配置文件是 `AIpy/src/aipy/config.json`（⚠️ 不在项目根），模板 `AIpy/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
+- 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `AIpy/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
 - 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
 - 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 10 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。

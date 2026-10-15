@@ -78,8 +78,10 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 ```
 AI_Projects/
 ├── backend/                      # Python AI 后端
-│   ├── main.py                # 入口：FastAPI + LangGraph 对话图调度，POST /chat + POST /config
-│   ├── config.example.json    # LLM 配置模板（随仓库分发，真实 config.json 已 gitignore）
+│   ├── main.py                # 入口：FastAPI + LangGraph 对话图调度，POST /chat + GET /health + POST /config；末尾内置 __main__ 块（打包 exe 直跑）
+│   ├── config.example.json    # LLM 配置模板（随仓库分发）
+│   ├── config.json            # 【自行创建，不入库】真实配置（含 API Key），与模板同在 backend/ 根
+│   ├── backend.spec           # PyInstaller 打包配置（onedir，构建 exe 用）
 │   ├── pyproject.toml         # uv 依赖管理
 │   ├── wiki_data/             # 知识库源文件（Markdown，随仓库分发）
 │   │   ├── crops.md           # 四季作物
@@ -90,7 +92,6 @@ AI_Projects/
 │   │   │   ├── state.py       # 图状态：messages（自动累积历史）/ player_state / context / error
 │   │   │   └── graph.py       # retrieve → chat 两节点 + AsyncSqliteSaver 记忆持久化
 │   │   ├── llm_factory.py     # LLM 工厂：读/写 config.json 创建本地/云端对话模型
-│   │   ├── config.json        # 【自行创建，不入库】真实配置（含 API Key）
 │   │   ├── embeddings.py      # 本地嵌入封装：fastembed（ONNX）实现 LangChain Embeddings
 │   │   └── build_knowledge_base.py  # 建库脚本：wiki_data → chroma_db
 │   ├── data/                  # 对话历史 SQLite（checkpoints.db，本地生成，已 gitignore）
@@ -157,7 +158,7 @@ AI_Projects/
 | 文件 | 位置 | 用途 | 谁写 |
 |---|---|---|---|
 | `ModConfig.json` | `Mods/StardewAIAssistant/`（游戏侧） | 游戏读取，决定推送给后端的配置 | GMCM 保存时自动写入 |
-| `config.json` | `backend/src/aipy/`（后端侧） | 后端读取，决定用哪个 LLM | 后端收到推送后自动写入 |
+| `config.json` | `backend/`（后端根） | 后端读取，决定用哪个 LLM；打包模式下在 exe 同级目录 | 后端收到推送后自动写入 |
 
 **首次配置流程**：
 1. 启动 Python 后端（`uv run uvicorn main:app --reload --port 8000`）
@@ -236,16 +237,16 @@ uv run python src/aipy/build_knowledge_base.py
 
 **方式二：手动编辑配置文件（无 GMCM 时）**
 
-后端启动时从 **`src/aipy/config.json`** 读取对话模型配置。仓库只提供模板 [config.example.json](backend/config.example.json)，真实配置含 API Key，已加入 `.gitignore` 不会被提交。
+后端启动时从 **`backend/config.json`** 读取对话模型配置。仓库只提供模板 [config.example.json](backend/config.example.json)，真实配置含 API Key，已加入 `.gitignore` 不会被提交。
 
-把模板复制到 `src/aipy/` 下并改名（⚠️ 注意目标位置在 `src/aipy/`，不是项目根目录——工厂按自己所在目录找 config.json）：
+把模板复制为真实配置（模板和真实配置同在 backend/ 根，不再有历史版本"模板/真实分居两处"的坑）：
 
 ```bash
 # 在 backend/ 目录下
-cp config.example.json src/aipy/config.json
+cp config.example.json config.json
 ```
 
-然后按所选模式编辑 `src/aipy/config.json`：
+然后按所选模式编辑 `backend/config.json`：
 
 **本地模式（免 Key，默认推荐先跑通）：**
 
@@ -280,6 +281,18 @@ uv run uvicorn main:app --port 8000      # 启动服务（调试可加 --reload�
 ```
 
 启动日志出现「向量库加载完成」和 `[LLM] provider=..., model=...` 即表示知识库与对话模型均正常载入。
+
+**打包成 exe（路线 2 第一阶段已通）**：
+
+```bash
+# 在 backend/ 目录下
+uv run pyinstaller backend.spec --noconfirm
+# 产物 dist/backend/backend.exe（onedir 形态）
+# 把 chroma_db/ models/ config.json（可选 wiki_data/）拷到 exe 同级 = 发布形态
+# 双击 backend.exe 或被 C# Mod 拉起，与 uv run 等价
+```
+
+数据文件不打进 exe：打包模式下 `config.py` 的 `PROJECT_ROOT` 指向 exe 所在目录，exe 同级就是"项目根"，玩家改配置/换知识库都在 exe 旁边操作。
 
 > 注意命令必须是 `uv run uvicorn ...`，直接写 `uv uvicorn` 会报 `unrecognized subcommand 'uvicorn'`。
 >
@@ -372,7 +385,7 @@ dotnet build
 
 - `provider` 白名单：`ollama` / `deepseek` / `zhipu` / `qwen` / `kimi`，其他值返回 400
 - `provider != ollama` 时 `api_key` 必填，`model` 必填；`temperature` 必须在 0.0-2.0；校验失败返回 400 + 错误详情
-- 成功：写 `src/aipy/config.json` → 重建 LLM → 重新注入对话图，返回 `{"status": "ok", "provider": ..., "model": ..., "temperature": ...}`；**对话历史（SQLite）保留，不重建 graph**
+- 成功：写 `backend/config.json` → 重建 LLM → 重新注入对话图，返回 `{"status": "ok", "provider": ..., "model": ..., "temperature": ...}`；**对话历史（SQLite）保留，不重建 graph**
 - C# 端 GMCM 保存时自动推送；后端未启动时 C# 只写本地 `ModConfig.json`
 
 注意事项：
@@ -386,7 +399,7 @@ dotnet build
 - [x] 扩充状态感知（第一批）：季节、天气、日期、金币、血量（C# 收集 + Python 注入提示词）
 - [x] 游戏内自由提问：借原版聊天框实现（按 T → `AI 问题` → Harmony 拦截），回复进聊天框可翻历史；v0.9 起另有 F7 中文输入框（见下）
 - [x] LLM provider / 模型可配置：`config.json` + LLM 工厂，支持 ollama / deepseek / zhipu / qwen / kimi（BYOK 基础）
-- [x] 游戏内配置界面（GMCM，2026-10-14）：ESC → Mod 选项 → 填厂商/Key/模型 → 保存推送后端 `POST /config`，写文件 + 重建 LLM，无需重启；无 GMCM 时可手动编辑 `src/aipy/config.json`
+- [x] 游戏内配置界面（GMCM，2026-10-14）：ESC → Mod 选项 → 填厂商/Key/模型 → 保存推送后端 `POST /config`，写文件 + 重建 LLM，无需重启；无 GMCM 时可手动编辑 `backend/config.json`
 - [x] 模型参数可配置化（2026-10-14）：temperature 全链路打通——GMCM 数值选项 → `POST /config`（校验 0.0-2.0）→ 写 config.json → 重建 LLM 实时生效；检索 top-k 已挪进 `aipy/config.py`
 - [x] 中文 IME 输入框（v0.9，2026-10-14）：F7 开关自研输入框，直连 MonoGame `GameWindow.TextInput` 接收 IME 上屏字符（SMAPI 4 无 TextInput 封装，见 NOTES 踩坑 23）；打开期间按键全接管防误操作，回车复用聊天框回复链路
 - [x] 漂浮机器人（第一版，2026-10-14）：robot.png 贴图渲染 + 跟随玩家 + sin 浮动动画
@@ -401,14 +414,15 @@ dotnet build
 - [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求
 - [x] 后端生命周期打通（2026-10-15）：`GET /health` 零开销探活 + C# 启动时检测 / 自动拉起（uv，轮询最多 30 秒，日志落 `backend.log`）/ 游戏退出自动关闭自己拉起的进程；GMCM 新增「后端目录路径」「自动启动后端」
 - [x] 后端打包准备就绪（2026-10-15）：`main.py` 内置程序入口（`python main.py` / 双击 exe 直接跑，无需命令行参数）；嵌入模型缓存固定到 `backend/models/`（已下载则离线加载，打包随包分发零下载）；`chroma_db` 缺失时不再崩溃——跳过检索，AI 回答"不清楚"并打印建库指引
-- [ ] **面向玩家打包（当前优先级，路线 2）**：PyInstaller 打包 exe（随包带上 `chroma_db/` + `models/`）+ 把"自动拉起 uv"换成"拉起打包好的 exe"，做到玩家零环境依赖
+- [x] PyInstaller 打包第一阶段（2026-10-15）：`backend.spec`（onedir）构建 `dist/backend/backend.exe`，exe 同级放 chroma_db/models/config.json 即发布形态；实测 /health 200 + /chat 检索问答全链路通过（chromadb 动态导入需 `collect_submodules`，见 NOTES 踩坑 27）
+- [ ] **面向玩家打包（当前优先级，路线 2）**：组装发布包（exe + Mod + 数据）+ 把"自动拉起 uv"换成"拉起打包好的 exe" + 体积优化，做到玩家零环境依赖
 
 ## 常见问题
 
 | 现象 | 原因与解决 |
 |---|---|
-| 后端启动日志显示 `[LLM] 未配置...` | 正常现象——等你在游戏里 GMCM 配置完会自动切换；或手动 `cp config.example.json src/aipy/config.json` 后重启（⚠️ 必须放在 `src/aipy/` 下，放项目根目录不生效） |
-| 云端模式报 401 / 认证失败 | API Key 没填、填错或欠费；检查 `src/aipy/config.json` 的 `api_key` 与 `model` 名称；或检查 GMCM 里填的 Key 是否含空格 |
+| 后端启动日志显示 `[LLM] 未配置...` | 正常现象——等你在游戏里 GMCM 配置完会自动切换；或手动 `cp config.example.json config.json`（在 backend/ 下执行）后重启 |
+| 云端模式报 401 / 认证失败 | API Key 没填、填错或欠费；检查 `backend/config.json` 的 `api_key` 与 `model` 名称；或检查 GMCM 里填的 Key 是否含空格 |
 | 手动改了 config.json 没反应 | 手动改的配置只在后端启动时读取。**推荐用游戏内 GMCM 保存**（走 `/config` 接口热更新，无需重启） |
 | AI 回复驴唇不对马嘴 / 像串了别人的对话 | 多轮记忆按玩家名（thread_id）隔离：改了角色名 = 新会话；测试残留的旧历史会一直保留，想让 AI"失忆"就删 `backend/data/checkpoints.db` 后重启后端 |
 | `uv uvicorn` 报 `unrecognized subcommand` | 少了 `run`，正确命令是 `uv run uvicorn main:app --port 8000` |

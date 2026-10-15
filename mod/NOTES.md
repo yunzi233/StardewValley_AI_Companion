@@ -87,6 +87,7 @@
     - 现象：把 `config.example.json` 复制到 `backend/config.json`（项目根），后端照样报 `缺少配置文件`。
     - 原因：`llm_factory.py` 里写的是 `Path(__file__).parent / "config.json"`，工厂模块在 `src/aipy/`，所以真实配置必须位于 `backend/src/aipy/config.json`；而 example 模板放在 `backend/` 根目录，复制时目标路径容易写错。
     - 解决：`cp config.example.json src/aipy/config.json`（在 backend/ 下执行）。模板和真实配置不同目录这点要在 README 写醒目。
+    - 【2026-10-15 已解决】配置路径统一：新增 `aipy.config.CONFIG_FILE = PROJECT_ROOT / "config.json"`，工厂改为 `from aipy.config import CONFIG_FILE`，不再自己拼 `Path(__file__)`；真实配置迁到 `backend/config.json`（模板/真实同目录，坑源铲除）。迁移动机是打包：PyInstaller 模式下 PROJECT_ROOT=exe 所在目录，config.json 放 exe 同级即"项目根"。
 
 18. **`uv uvicorn` 会被当成 uv 的子命令，必须 `uv run`**
     - 现象：执行 `uv uvicorn main:app --reload` 报 `error: unrecognized subcommand 'uvicorn'`。
@@ -144,6 +145,12 @@
     - 根因：SMAPI 4.0 移除了该事件（旧版它就触发不稳定）。用 Mono.Cecil 反射 `StardewModdingAPI.dll` 确认：`IGameLoopEvents` 全部事件里没有任何 Exit 类事件，整个程序集的 `*EventArgs` 里也没有 `ExitingEventArgs`；只剩内部方法 `SGame.OnExiting`（MonoGame `Game.OnExiting` 的重写，Mod 无法订阅）。
     - 解决：`AppDomain.CurrentDomain.ProcessExit += OnProcessExiting`——窗口关闭 / 游戏菜单退出等正常退出路径都会在 CLR 关闭前触发；注意两点：① 处理函数有约 2 秒时限，只做 `Kill(entireProcessTree:true)`（毫秒级）够用；② 任务管理器强杀 / 崩溃时不触发（旧 `GameLoop.Exiting` 同样不保证，可接受）。
     - 附带：反射 SMAPI 程序集别用 `Assembly.LoadFrom` + `GetTypes()`（缺依赖抛 ReflectionTypeLoadException），用游戏自带的 `smapi-internal\Mono.Cecil.dll` 的 `ModuleDefinition.ReadModule` 读类型/事件最稳。
+
+27. **PyInstaller 打包 chromadb：全部组件 importlib 动态加载，必须 `collect_submodules("chromadb")`**
+    - 现象：backend.spec 第一版打包出的 exe 启动即挂 `ModuleNotFoundError: No module named 'chromadb.api.rust'`（栈在 `chromadb.config.get_class → importlib.import_module`）。
+    - 根因：chromadb 的各组件（api 实现 / segment / db / 遥测）都是运行时按 config 里的字符串 `importlib.import_module("chromadb.xxx.Yyy")` 动态加载的，PyInstaller 静态分析一个都跟不到；逐个补 hiddenimports 没完没了（修完 api.rust 还有下一个）。
+    - 解决：spec 里 `collect_submodules("chromadb")` 一网打尽——只收集 .py 模块，体积可控；**别用 collect_all**（会把测试数据冗余资源全塞进去）。同理 uvicorn 的 `loops/protocols/lifespan` 也是运行时动态挑选实现，要在 hiddenimports 里显式列 `.auto` + 具体实现模块（如 `uvicorn.protocols.http.h11_impl`）。
+    - 附带：数据文件（chroma_db/models/config.json）**不打进 exe**，放 exe 同级目录即可——config.py 的 frozen 分支让 PROJECT_ROOT=exe 所在目录，exe 同级就是"项目根"；验证 exe 别用"命令结束即回收子进程"的终端包装器，要用独立后台任务持有进程再测 /health。
 
 ## 二、核心机制备忘
 
@@ -317,7 +324,7 @@
 | 块 | 位置 | 作用 |
 |---|---|---|
 | `PROVIDERS` | L9-14 | 云端厂商预设 base_url：deepseek / zhipu（智谱）/ qwen（通义）/ kimi |
-| `CONFIG_PATH` | L16 | `Path(__file__).parent/"config.json"` → 真实配置在 `src/aipy/` 下（不是项目根） |
+| `CONFIG_FILE` | L9 import | 从 `aipy.config` 导入（`PROJECT_ROOT / "config.json"`：开发=backend/config.json，打包=exe 同级）；`load_config` / `save_config` 共用，工厂不再自拼路径 |
 | `load_config` | L19-25 | config.json 不存在直接抛 FileNotFoundError 并提示复制 example |
 | `save_config` | L28-34 | 覆盖写 config.json（UTF-8，缩进 2），供 /config 接口调用 |
 | `create_llm` | L37-62 | `ollama` → `ChatOllama(model, base_url, temperature)`；其他 provider 校验 api_key 非空后返回 `ChatOpenAI(model, api_key, base_url=预设, temperature)`；temperature 读 cfg（默认 0.7，老 config.json 无此字段时兼容） |
@@ -328,14 +335,15 @@
 
 | 常量 | 位置 | 作用 |
 |---|---|---|
-| `PROJECT_ROOT` | L10 | `Path(__file__).resolve().parents[2]` → `backend/` 根目录 |
-| `CHROMA_DIR` | L13 | `PROJECT_ROOT / "chroma_db"`，向量库持久化目录 |
-| `COLLECTION_NAME` | L14 | `"stardew_wiki"`，Chroma 集合名（main.py 和建库脚本必须一致） |
-| `EMBEDDING_MODEL` | L22 | `"BAAI/bge-small-zh-v1.5"`，fastembed 本地 ONNX 嵌入模型名；换模型=换维度必须重建库（原 `OLLAMA_BASE_URL` 已随 Ollama 嵌入一并移除） |
-| `MODELS_DIR` | L19 | `PROJECT_ROOT / "models"`，fastembed 缓存目录（`cache_dir`）：已下载离线加载、缺失自动下载到此；打包时随包分发 |
-| `TOP_K` | L21 | `3`，检索召回块数 |
-| `WIKI_DATA_DIR` | L24 | `PROJECT_ROOT / "wiki_data"`，知识库源 Markdown 目录 |
-| `CHECKPOINT_DB` | L28 | `PROJECT_ROOT / "data" / "checkpoints.db"`，对话历史 SQLite 文件（AsyncSqliteSaver 落盘用，已 gitignore） |
+| `PROJECT_ROOT` | L13-19 | **frozen 分支**：PyInstaller 打包模式（`sys.frozen`）= `Path(sys.executable).parent`（exe 同级即项目根）；开发模式 = `Path(__file__).resolve().parents[2]` → `backend/`。打包后 `__file__` 指向临时解包目录，全部派生路径会错位，必须切 sys.executable |
+| `CONFIG_FILE` | L24 | `PROJECT_ROOT / "config.json"`，后端配置（含 API Key）；打包模式放 exe 同级，玩家好找好改好备份 |
+| `CHROMA_DIR` | L27 | `PROJECT_ROOT / "chroma_db"`，向量库持久化目录 |
+| `COLLECTION_NAME` | L28 | `"stardew_wiki"`，Chroma 集合名（main.py 和建库脚本必须一致） |
+| `EMBEDDING_MODEL` | L37 | `"BAAI/bge-small-zh-v1.5"`，fastembed 本地 ONNX 嵌入模型名；换模型=换维度必须重建库（原 `OLLAMA_BASE_URL` 已随 Ollama 嵌入一并移除） |
+| `MODELS_DIR` | L33 | `PROJECT_ROOT / "models"`，fastembed 缓存目录（`cache_dir`）：已下载离线加载、缺失自动下载到此；打包时随包分发 |
+| `TOP_K` | L40 | `3`，检索召回块数 |
+| `WIKI_DATA_DIR` | L43 | `PROJECT_ROOT / "wiki_data"`，知识库源 Markdown 目录 |
+| `CHECKPOINT_DB` | L47 | `PROJECT_ROOT / "data" / "checkpoints.db"`，对话历史 SQLite 文件（AsyncSqliteSaver 落盘用，已 gitignore） |
 
 ### Python 端：`backend/src/aipy/embeddings.py`（本地嵌入封装，新增）
 
@@ -389,16 +397,17 @@
 - [x] 嵌入改本地 ONNX（2026-10-15）：`OllamaEmbeddings`(bge-m3, 1024 维) → `FastEmbedEmbeddings`(`BAAI/bge-small-zh-v1.5`, 512 维, int8 ~23MB)；新增 `aipy/embeddings.py` 封装，`config.py` 换模型常量并移除 `OLLAMA_BASE_URL`，`chroma_db/` 全量重建；经 5 组问题验证检索质量（鱼类/礼物命中准确，季节类问题受 KB 结构限制）。
 - [x] 后端生命周期打通（2026-10-15）：Python 端 `GET /health`（不触发检索/LLM，返回 status/llm_configured/provider；`_config` 兜底空 dict 防 NameError）；C# 端 `CheckBackendHealthAsync`（3 秒超时）→ `EnsureBackendReadyAsync`（可达提示 / 不可达按 GMCM 配置自动拉起）→ `StartBackendAsync`（uv 拉起 + 双流写 backend.log + 轮询 30 秒）→ 退出钩子 `AppDomain.ProcessExit` Kill 进程树（SMAPI 4 无 GameLoop.Exiting，见踩坑 26）；GMCM 新增 BackendDir / AutoStartBackend 两配置项。
 - [x] 后端打包准备就绪（2026-10-15）：`main.py` 末尾内置 `__main__` 入口（`uvicorn.run(app, "127.0.0.1", 8000)`，**必须放在所有路由注册之后**，放中间会被 run 阻塞导致后面的路由注册不到——实测踩过）；嵌入模型缓存固定 `backend/models/`（离线优先，实测 `HF_HUB_OFFLINE=1` 可出 512 维向量）；`chroma_db` 缺失时 `_NullRetriever` 兜底不崩（AI 回答"不清楚"）。
-- [ ] 面向玩家打包（当前优先级，路线 2）：PyInstaller 打包 exe（随包分发 `chroma_db/` + `models/`）+ 把"拉起 uv"换成"拉起打包好的 exe"，做到玩家零环境依赖（自动拉起 + /health 就绪检测已完成）。
+- [x] PyInstaller 打包第一阶段（2026-10-15）：`backend.spec`（onedir，数据文件不打进 exe）→ `dist/backend/backend.exe`；exe 同级放 chroma_db/models/config.json = 发布形态，实测 /health 200 + /chat 检索问答全链路通过（chromadb 全组件动态 import 需 `collect_submodules`，见踩坑 27）；打包命令 `uv run pyinstaller backend.spec --noconfirm`
+- [ ] 面向玩家打包（当前优先级，路线 2）：组装发布包（exe + Mod DLL + 数据文件）+ 把"拉起 uv"换成"拉起打包好的 exe"（改 ModEntry.cs 的 ProcessStartInfo）+ 体积优化，做到玩家零环境依赖。
 
 ## 五、环境备忘
 
 - Python 后端目录：`D:\StardewValley_AI_Companion\backend`（与本 Mod 同一个根仓库），入口 `main.py`，FastAPI + uvicorn，uv 管理依赖，Python >=3.11。
 - 嵌入模型：fastembed `BAAI/bge-small-zh-v1.5`（ONNX int8），随 Python 依赖自带、无需 Ollama；模型缓存固定在 `backend/models/`（gitignore，打包随包分发；开发模式首次下载到该目录，国内先设 `HF_ENDPOINT=https://hf-mirror.com`）。Ollama 只在"本地对话模式"下需要（`qwen2.5:3b`），云端模式不需要本地对话模型。
-- LLM 配置：真实配置文件是 `backend/src/aipy/config.json`（⚠️ 不在项目根），模板 `backend/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
+- LLM 配置：真实配置文件是 `backend/config.json`（2026-10-15 起与模板同在 backend/ 根，旧"必须在 src/aipy/ 下"的规则已废除，见踩坑 17），模板 `backend/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
 - 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `backend/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
-- 启动：两种方式——① 手动：在 `D:\StardewValley_AI_Companion\backend` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）；② 自动：GMCM 填 BackendDir + 开 AutoStartBackend，进游戏 C# 自动用 uv 拉起（日志落 `backend/backend.log`，游戏退出时自动关闭）。
+- 启动：三种方式——① 手动：在 `D:\StardewValley_AI_Companion\backend` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）或等价 `uv run python main.py`；② 自动：GMCM 填 BackendDir + 开 AutoStartBackend，进游戏 C# 自动用 uv 拉起（日志落 `backend/backend.log`，游戏退出时自动关闭）；③ 打包 exe：`uv run pyinstaller backend.spec --noconfirm` 后双击 `dist/backend/backend.exe`（数据文件放 exe 同级，见踩坑 27 附带）。
 - 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 17 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/CurrentTool/FarmingLevel/MiningLevel/DaysPlayed/Inventory/NPCAffection/CurrentQuest/Message；返回小写 `{"reply":..., "emotion":...}`。另有 `GET /health`（启动检测用，零开销：不检索不调 LLM，返回 `{"status":"ok","llm_configured":bool,"provider":str}`，注意 provider 在运行中切换配置后可能滞后）与 `POST /config`。改字段两头要一起改，且改完 C# 别忘了重新 build。
 - 多轮记忆：LangGraph `AsyncSqliteSaver`（SQLite 落盘 `backend/data/checkpoints.db`），`thread_id` 用玩家名隔离；重启后端历史不丢，删该文件即清空（见核心机制备忘第 7 条、踩坑 19）。
 - Harmony：dll 在 `D:\Steam\steamapps\common\Stardew Valley\smapi-internal\0Harmony.dll`，csproj 显式引用 + `Private=false`；Entry 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 安装。

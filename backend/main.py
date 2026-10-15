@@ -98,15 +98,34 @@ class PlaceholderLLM:
         )
 
 # ========== 启动时加载向量库（只做一次）==========
-print("正在加载向量库...")
-embeddings = FastEmbedEmbeddings(model_name=EMBEDDING_MODEL)
-vectorstore = Chroma(
-    persist_directory=str(CHROMA_DIR),
-    embedding_function=embeddings,
-    collection_name=COLLECTION_NAME,
-)
-retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K})
-print("向量库加载完成")
+class _NullRetriever:
+    """chroma_db 缺失时的兜底检索器：永远返回空结果。
+       不让后端崩溃——chat_node 拿到空 context，按系统提示词的规则
+       回答"这个我不太清楚，建议你查一下 Wiki"，玩家能明确感知知识库没带上。"""
+
+    async def ainvoke(self, query):
+        print(f"[检索] 知识库未加载，跳过检索：query={query!r}")
+        return []
+
+
+if CHROMA_DIR.exists():
+    print("正在加载向量库...")
+    embeddings = FastEmbedEmbeddings(model_name=EMBEDDING_MODEL)
+    vectorstore = Chroma(
+        persist_directory=str(CHROMA_DIR),
+        embedding_function=embeddings,
+        collection_name=COLLECTION_NAME,
+    )
+    retriever = vectorstore.as_retriever(search_kwargs={"k": TOP_K})
+    print("向量库加载完成")
+else:
+    # 打包分发时 chroma_db/ 必须随包带上（建好的知识库直接复用，不用重新向量化）；
+    # 缺失不致命：跳过检索而不是崩溃，具体修法打印在日志里
+    print(f"[警告] 未找到知识库目录 {CHROMA_DIR}，检索功能不可用（AI 会回答『不清楚』）。")
+    print("       开发模式：在 backend/ 下执行 uv run python -m aipy.build_knowledge_base 建库")
+    print("       打包分发：把 backend/chroma_db/ 整个目录随包带上")
+    vectorstore = None
+    retriever = _NullRetriever()
 
 # ========== 对话模型 ==========
 # config.json 不存在或格式错时用 PlaceholderLLM 启动，不阻塞后端；
@@ -246,3 +265,14 @@ async def update_config(cfg: ConfigRequest):
 
     print(f"[LLM] 已切换为 provider={cfg.provider}, model={cfg.model}, temperature={cfg.temperature}")
     return {"status": "ok", "provider": cfg.provider, "model": cfg.model, "temperature": cfg.temperature}
+
+
+# ========== 程序入口（打包友好）==========
+# 必须放在所有路由注册之后：uvicorn.run() 会阻塞在本行，写在中间会导致
+# 后面的路由定义执行不到。PyInstaller 打包成 exe 后，双击或被 C# Mod
+# 拉起时直接运行本文件即可，无需命令行参数（uvicorn 命令行只用于开发调试）。
+if __name__ == "__main__":
+    import uvicorn
+
+    # host 固定 127.0.0.1：后端只服务本机的游戏 Mod，不暴露到局域网
+    uvicorn.run(app, host="127.0.0.1", port=8000)

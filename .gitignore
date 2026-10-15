@@ -6,6 +6,8 @@ backend/.env
 backend/.python-version
 # RAG 向量库：本地由建库脚本生成，不随仓库分发
 backend/chroma_db/
+# 嵌入模型本地缓存：fastembed 下载/分发的 ONNX 模型，体积大不入库（打包时随包分发）
+backend/models/
 
 # ===== C# =====
 mod/**/bin/

@@ -260,6 +260,9 @@ namespace StardewAIAssistant
                     {
                         Helper.WriteConfig(_config);
                         _ = PushConfigToBackendAsync(_config);
+                        // 保存后立刻重新检测/拉起后端：玩家刚填完 BackendDir 就能马上用，
+                        // 不用重启游戏（否则 EnsureBackendReadyAsync 只在 OnGameLaunched 跑一次）
+                        _ = EnsureBackendReadyAsync();
                     }
                 );
 

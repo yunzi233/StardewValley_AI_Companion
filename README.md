@@ -216,7 +216,8 @@ uv run python src/aipy/build_knowledge_base.py
 
 > 注意：
 > - 脚本采用**全量重建**（先删除旧 `chroma_db/` 再写入），修改 wiki 后重跑即可，不会产生重复数据
-> - 首次运行会先下载嵌入模型（~23MB，缓存到系统临时目录 `fastembed_cache`），之后离线秒级完成
+> - 首次运行会先下载嵌入模型（~23MB，缓存到 `backend/models/`，**不再落在系统临时目录**），之后完全离线；国内网络下载超时先设 `$env:HF_ENDPOINT="https://hf-mirror.com"` 再跑
+> - 打包分发时 `chroma_db/` 与 `models/` 都随包带上即可，玩家侧零下载、零建库
 > - 重建前先停掉正在运行的后端（旧 `chroma_db/` 文件被占用会报 `PermissionError [WinError 32]`）
 > - `chroma_db/` 是本地生成物，**不随仓库分发**（已加入 `.gitignore`），换机器或重新克隆后必须重新建库，否则后端启动/检索会报错
 
@@ -275,6 +276,7 @@ cp config.example.json src/aipy/config.json
 ```bash
 cd backend
 uv run uvicorn main:app --port 8000      # 启动服务（调试可加 --reload）
+# 或等价：uv run python main.py （程序内置入口，与打包 exe 的运行方式一致）
 ```
 
 启动日志出现「向量库加载完成」和 `[LLM] provider=..., model=...` 即表示知识库与对话模型均正常载入。
@@ -398,7 +400,8 @@ dotnet build
 - [ ] 主动提醒：不对话时 AI 偶尔主动提示玩家（触发机制待定，如体力低 / 节日 / 任务到期）
 - [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求
 - [x] 后端生命周期打通（2026-10-15）：`GET /health` 零开销探活 + C# 启动时检测 / 自动拉起（uv，轮询最多 30 秒，日志落 `backend.log`）/ 游戏退出自动关闭自己拉起的进程；GMCM 新增「后端目录路径」「自动启动后端」
-- [ ] **面向玩家打包（当前优先级，路线 2）**：PyInstaller 打包 exe + 把"自动拉起 uv"换成"拉起打包好的 exe"，做到玩家零环境依赖（嵌入已先行切到 fastembed，见上）
+- [x] 后端打包准备就绪（2026-10-15）：`main.py` 内置程序入口（`python main.py` / 双击 exe 直接跑，无需命令行参数）；嵌入模型缓存固定到 `backend/models/`（已下载则离线加载，打包随包分发零下载）；`chroma_db` 缺失时不再崩溃——跳过检索，AI 回答"不清楚"并打印建库指引
+- [ ] **面向玩家打包（当前优先级，路线 2）**：PyInstaller 打包 exe（随包带上 `chroma_db/` + `models/`）+ 把"自动拉起 uv"换成"拉起打包好的 exe"，做到玩家零环境依赖
 
 ## 常见问题
 

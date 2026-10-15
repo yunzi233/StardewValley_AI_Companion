@@ -136,7 +136,7 @@
     - 现象：`FastEmbedEmbeddings("BAAI/bge-small-zh-v1.5")` 首次构造时连报 `Could not download model from HuggingFace: timed out`，重试 3 次后 `ValueError: Could not load model ... from any source`。
     - 原因：fastembed 底层用 `huggingface_hub` 拉 ONNX 模型，默认端点 `huggingface.co` 在国内不稳定；它自带的备用源（GCS）同样连不上。
     - 解决：先设镜像再跑——PowerShell `$env:HF_ENDPOINT="https://hf-mirror.com"`（`huggingface_hub` 自动识别该环境变量），再执行建库脚本；模型 ~23MB，约 20 秒拉完。
-    - 附带：默认缓存目录是 `tempfile.gettempdir()/fastembed_cache`（即系统临时目录），**可能被清理工具清掉**，之后首次检索会重新下载。后续打包（路线 2）宜把缓存固定到后端目录，避免玩家侧反复下载。
+    - 附带：默认缓存目录是 `tempfile.gettempdir()/fastembed_cache`（即系统临时目录），**可能被清理工具清掉**，之后首次检索会重新下载。【2026-10-15 已解决】`FastEmbedEmbeddings` 现在把 `cache_dir` 固定为 `backend/models/`（config.py 的 `MODELS_DIR`）：已下载则离线加载、没下载则下到这里；fastembed 0.9 的 `download_model` 缓存命中时不联网，`HF_HUB_OFFLINE=1` 下实测可正常出 512 维向量。打包时整个 `models/` 随包分发即零下载（目录结构是 HF 风格 `models--Qdrant--bge-small-zh-v1.5/`，实际仓库名是 Qdrant 镜像而非 BAAI 原仓库）。
     - 附带：重建向量库前必须先停掉运行中的后端——旧 `chroma_db/*.bin` 被占用时 `shutil.rmtree` 直接报 `PermissionError [WinError 32]`。
 
 26. **SMAPI 4 没有 `GameLoop.Exiting` 事件（3.x 的 API 被 4.0 移除），退出钩子要用 `AppDomain.ProcessExit`**
@@ -286,7 +286,8 @@
 | `SYSTEM_PROMPT` | L16-38 | 角色设定 + 铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 非游戏话题拒答，附正反示例 |
 | `ChatRequest` / `ChatResponse` / `ConfigRequest` | L40-51 / L54-56 / L59-62 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health）；ConfigRequest 供 GMCM 推送 |
 | `PlaceholderLLM` | L65-73 | 未配置时占位，ainvoke 返回固定提示 |
-| 向量库初始化 | L75-84 | 模块级只跑一次：从 `aipy.config` 读常量 → `FastEmbedEmbeddings`（aipy/embeddings.py）+ `Chroma` → `retriever`（k=`TOP_K`） |
+| 向量库初始化 | L100-128 | 模块级只跑一次：`CHROMA_DIR` 存在 → `FastEmbedEmbeddings` + `Chroma` → `retriever`（k=`TOP_K`）；缺失 → 打印警告 + `_NullRetriever`（检索返回空，AI 回答"不清楚"，后端不崩） |
+| `_NullRetriever` | L101-108 | chroma_db 缺失的兜底检索器：`ainvoke` 恒返回 `[]`，chat_node 拿空 context 走"不知道"分支 |
 | lifespan | L21-25 | async 上下文里 `build_graph()`——AsyncSqliteSaver 3.x 构造时要 running loop（见踩坑 21）；顶层 `graph = None` |
 | LLM 创建 | L104-110 | try-except：`load_config()` → `create_llm()` 工厂创建，失败用 PlaceholderLLM 占位 |
 | 依赖注入 | L115 | `init_agent()` 注入 llm/retriever/system_prompt（graph 已在 lifespan 构建好） |
@@ -330,7 +331,8 @@
 | `PROJECT_ROOT` | L10 | `Path(__file__).resolve().parents[2]` → `backend/` 根目录 |
 | `CHROMA_DIR` | L13 | `PROJECT_ROOT / "chroma_db"`，向量库持久化目录 |
 | `COLLECTION_NAME` | L14 | `"stardew_wiki"`，Chroma 集合名（main.py 和建库脚本必须一致） |
-| `EMBEDDING_MODEL` | L18 | `"BAAI/bge-small-zh-v1.5"`，fastembed 本地 ONNX 嵌入模型名；换模型=换维度必须重建库（原 `OLLAMA_BASE_URL` 已随 Ollama 嵌入一并移除） |
+| `EMBEDDING_MODEL` | L22 | `"BAAI/bge-small-zh-v1.5"`，fastembed 本地 ONNX 嵌入模型名；换模型=换维度必须重建库（原 `OLLAMA_BASE_URL` 已随 Ollama 嵌入一并移除） |
+| `MODELS_DIR` | L19 | `PROJECT_ROOT / "models"`，fastembed 缓存目录（`cache_dir`）：已下载离线加载、缺失自动下载到此；打包时随包分发 |
 | `TOP_K` | L21 | `3`，检索召回块数 |
 | `WIKI_DATA_DIR` | L24 | `PROJECT_ROOT / "wiki_data"`，知识库源 Markdown 目录 |
 | `CHECKPOINT_DB` | L28 | `PROJECT_ROOT / "data" / "checkpoints.db"`，对话历史 SQLite 文件（AsyncSqliteSaver 落盘用，已 gitignore） |
@@ -341,7 +343,7 @@
 
 | 块 | 位置 | 作用 |
 |---|---|---|
-| `FastEmbedEmbeddings` | L15-27 | 继承 `langchain_core.embeddings.Embeddings`，构造即加载 `fastembed.TextEmbedding`（首次自动下载 ONNX 模型） |
+| `FastEmbedEmbeddings` | L17-30 | 继承 `langchain_core.embeddings.Embeddings`，构造即加载 `fastembed.TextEmbedding`；`cache_dir` 默认指向 `MODELS_DIR`（backend/models/，本地优先、缺失才下载） |
 | `embed_documents` | L21-23 | 建库/索引侧：`TextEmbedding.embed(texts)` → `list[list[float]]` |
 | `embed_query` | L25-27 | 检索侧：`TextEmbedding.query_embed(text)`（BGE 的 query 指令前缀由 fastembed 内部处理） |
 
@@ -386,12 +388,13 @@
 - [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求。
 - [x] 嵌入改本地 ONNX（2026-10-15）：`OllamaEmbeddings`(bge-m3, 1024 维) → `FastEmbedEmbeddings`(`BAAI/bge-small-zh-v1.5`, 512 维, int8 ~23MB)；新增 `aipy/embeddings.py` 封装，`config.py` 换模型常量并移除 `OLLAMA_BASE_URL`，`chroma_db/` 全量重建；经 5 组问题验证检索质量（鱼类/礼物命中准确，季节类问题受 KB 结构限制）。
 - [x] 后端生命周期打通（2026-10-15）：Python 端 `GET /health`（不触发检索/LLM，返回 status/llm_configured/provider；`_config` 兜底空 dict 防 NameError）；C# 端 `CheckBackendHealthAsync`（3 秒超时）→ `EnsureBackendReadyAsync`（可达提示 / 不可达按 GMCM 配置自动拉起）→ `StartBackendAsync`（uv 拉起 + 双流写 backend.log + 轮询 30 秒）→ 退出钩子 `AppDomain.ProcessExit` Kill 进程树（SMAPI 4 无 GameLoop.Exiting，见踩坑 26）；GMCM 新增 BackendDir / AutoStartBackend 两配置项。
-- [ ] 面向玩家打包（当前优先级，路线 2）：PyInstaller 打包 exe + 随包分发后端做到玩家零环境依赖（自动拉起 + /health 就绪检测已完成，下一步把"拉起 uv"换成"拉起打包好的 exe"）。
+- [x] 后端打包准备就绪（2026-10-15）：`main.py` 末尾内置 `__main__` 入口（`uvicorn.run(app, "127.0.0.1", 8000)`，**必须放在所有路由注册之后**，放中间会被 run 阻塞导致后面的路由注册不到——实测踩过）；嵌入模型缓存固定 `backend/models/`（离线优先，实测 `HF_HUB_OFFLINE=1` 可出 512 维向量）；`chroma_db` 缺失时 `_NullRetriever` 兜底不崩（AI 回答"不清楚"）。
+- [ ] 面向玩家打包（当前优先级，路线 2）：PyInstaller 打包 exe（随包分发 `chroma_db/` + `models/`）+ 把"拉起 uv"换成"拉起打包好的 exe"，做到玩家零环境依赖（自动拉起 + /health 就绪检测已完成）。
 
 ## 五、环境备忘
 
 - Python 后端目录：`D:\StardewValley_AI_Companion\backend`（与本 Mod 同一个根仓库），入口 `main.py`，FastAPI + uvicorn，uv 管理依赖，Python >=3.11。
-- 嵌入模型：fastembed `BAAI/bge-small-zh-v1.5`（ONNX int8，~23MB），随 Python 依赖自带、无需 Ollama；首次建库自动下载到系统临时目录的 `fastembed_cache`（国内先设 `HF_ENDPOINT=https://hf-mirror.com`）。Ollama 只在"本地对话模式"下需要（`qwen2.5:3b`），云端模式不需要本地对话模型。
+- 嵌入模型：fastembed `BAAI/bge-small-zh-v1.5`（ONNX int8），随 Python 依赖自带、无需 Ollama；模型缓存固定在 `backend/models/`（gitignore，打包随包分发；开发模式首次下载到该目录，国内先设 `HF_ENDPOINT=https://hf-mirror.com`）。Ollama 只在"本地对话模式"下需要（`qwen2.5:3b`），云端模式不需要本地对话模型。
 - LLM 配置：真实配置文件是 `backend/src/aipy/config.json`（⚠️ 不在项目根），模板 `backend/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
 - 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `backend/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。

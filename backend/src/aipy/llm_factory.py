@@ -1,9 +1,12 @@
 """LLM 工厂：根据 config.json 动态创建对话模型。"""
 import json
-from pathlib import Path
 
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
+
+# 路径统一到 aipy.config（开发模式/打包模式共用同一套逻辑：
+# 开发模式 → backend/config.json，打包模式 → exe 同级 config.json）
+from aipy.config import CONFIG_FILE
 
 # OpenAI 兼容接口的厂商预设表
 PROVIDERS = {
@@ -13,22 +16,20 @@ PROVIDERS = {
     "kimi":     "https://api.moonshot.cn/v1",
 }
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
-
 
 def load_config() -> dict:
-    if not CONFIG_PATH.exists():
+    if not CONFIG_FILE.exists():
         raise FileNotFoundError(
-            f"缺少配置文件 {CONFIG_PATH}\n"
+            f"缺少配置文件 {CONFIG_FILE}\n"
             f"请复制 config.example.json 为 config.json 并填写 api_key。"
         )
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
 
 def save_config(cfg: dict) -> None:
     """把配置写入 config.json（覆盖写，UTF-8，缩进 2）。
        供 /config 接口调用，C# 端从游戏里推送的配置落盘用。"""
-    CONFIG_PATH.write_text(
+    CONFIG_FILE.write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

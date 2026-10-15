@@ -11,12 +11,23 @@
 from fastembed import TextEmbedding
 from langchain_core.embeddings import Embeddings
 
+from aipy.config import MODELS_DIR
+
 
 class FastEmbedEmbeddings(Embeddings):
-    """LangChain Embeddings 的最小实现，底层用 fastembed.TextEmbedding。"""
+    """LangChain Embeddings 的最小实现，底层用 fastembed.TextEmbedding。
 
-    def __init__(self, model_name: str):
-        self._model = TextEmbedding(model_name=model_name)
+    本地优先（打包友好）：cache_dir 固定指向 backend/models/——
+    模型已在该目录（快照完整）时直接离线加载，不联网；
+    没有时才下载到该目录（开发模式仍可用，且缓存不再落在系统临时目录）。
+    打包时把 models/ 随包分发即可做到玩家零下载。
+    """
+
+    def __init__(self, model_name: str, cache_dir: str | None = None):
+        self._model = TextEmbedding(
+            model_name=model_name,
+            cache_dir=cache_dir or str(MODELS_DIR),
+        )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         # 建库/索引侧：文档块 → 向量

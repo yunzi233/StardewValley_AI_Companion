@@ -19,7 +19,7 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 - 端到端通信（C# ↔ Python，HTTP + JSON）
 - 游戏内自由提问：**F7 中文输入框**（IME 正常上屏，按键全接管）或原版聊天框输入 `AI 问题`（Harmony 拦截提交），回复都进聊天框
 - RAG 知识库（ChromaDB + bge-m3 嵌入，已收录作物 / 鱼类 / NPC 礼物）
-- 游戏状态感知：名字 / 体力 / 血量 / 游戏时间 / 日期（1-28）/ 季节 / 是否下雨 / 地点 / 金币 / 手持工具 / 耕种 & 采矿等级 / 存档已玩天数
+- 游戏状态感知：名字 / 体力 / 血量 / 游戏时间 / 日期（1-28）/ 季节 / 是否下雨 / 地点 / 金币 / 手持工具 / 耕种 & 采矿等级 / 存档已玩天数 / 背包 / NPC 好感度 / 当日任务
 - LLM 配置化（BYOK 基础）：`config.json` 切换 provider——本地 `ollama`（免 Key）或云端 `deepseek` / `zhipu` / `qwen` / `kimi`（OpenAI 兼容接口，自带 Key）
 - 多轮对话记忆（LangGraph + SQLite 持久化）：AI 记得本次会话聊过的内容，按玩家名隔离历史，**重启后端也不丢**；上下文窗口只带最近 10 轮（完整历史仍存 SQLite，不丢数据）
 - 模型参数可配置：回答温度（temperature）在 GMCM 里调节（0.0-2.0，步长 0.1），随配置推送后端实时生效
@@ -320,6 +320,9 @@ dotnet build
   "Location": "Farm", "Money": 5320,
   "CurrentTool": "WateringCan", "FarmingLevel": 3,
   "MiningLevel": 2, "DaysPlayed": 41,
+  "Inventory": "Paragon x5, CopperOre x12",
+  "NPCAffection": "Abigail:10心, Leah:8心",
+  "CurrentQuest": "海莉的请求 - 给海莉送一个红罂粟",
   "Message": "海莉喜欢什么礼物？"
 }
 ```
@@ -341,10 +344,12 @@ dotnet build
 | `FarmingLevel` | int | 耕种等级（0-10） |
 | `MiningLevel` | int | 采矿等级（0-10） |
 | `DaysPlayed` | int | 存档已玩总天数 |
+| `Inventory` | string | 背包物品汇总（前 10 个非空物品，格式 `"名称 x数量"`，逗号分隔） |
+| `NPCAffection` | string | NPC 好感度汇总（好感>0 的前 8 个，格式 `"NPC名:心数心"`，按好感降序） |
+| `CurrentQuest` | string | 当前未完成任务的标题与目标（`"标题 - 当前目标"`），没有则 `""` |
 | `Message` | string | 玩家问题 |
 
-- `Message` 为玩家问题（来自 F7 中文输入框或聊天框 `AI ` 提问）；后端优先用它做向量检索，为空时回退为当前场景描述（地点/时间/体力）
-- 其余状态字段**不参与检索**，由后端整理成结构化中文状态块（季节会译为"春季"、`IsRaining` 译为"正在下雨/天气晴朗"）注入 LLM 提示词
+- `Message` 为玩家问题（来自 F7 中文输入框或聊天框 `AI ` 提问）；后端把 `季节/天气/地点` 作为前缀拼进检索 query（如 `[春季 晴天 Farm] 玩家问题`），其余状态字段由后端整理成结构化中文状态块（季节会译为"春季"、`IsRaining` 译为"正在下雨/天气晴朗"）注入 LLM 提示词
 
 **响应**（小写键名，C# 端通过 `PropertyNameCaseInsensitive` 映射）：
 
@@ -384,7 +389,7 @@ dotnet build
 - [x] 漂浮机器人（第一版，2026-10-14）：robot.png 贴图渲染 + 跟随玩家 + sin 浮动动画
 - [x] 扩充状态感知（第二批 a，2026-10-14）：当前工具 / 耕种 / 采矿等级 / 存档天数
 - [ ] 防连点：思考中重复提问应忽略或排队
-- [ ] 扩充状态感知（第二批 b）：背包、NPC 好感、当日任务；并让季节/天气参与检索 query
+- [x] 扩充状态感知（第二批 b，2026-10-15）：背包、NPC 好感、当日任务；并让季节/天气参与检索 query
 - [x] 多轮对话记忆：LangGraph 对话图 + AsyncSqliteSaver（SQLite 落盘 `AIpy/data/checkpoints.db`），按玩家名隔离历史，重启后端不丢
 - [ ] F7 / `AI ` 前缀改为可配置，避免与其他 Mod 冲突
 - [ ] `emotion` 字段驱动机器人表情 / 立绘变化

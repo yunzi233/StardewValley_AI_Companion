@@ -205,7 +205,7 @@
 | `EnqueueChatMessage` | L540 | 把 `chatBox.addMessage(text, color)` 打包入队；浅蓝=回复/提示，橙红=错误 |
 | `EnqueueChatMessageFromPatch` | L553 | internal 包装，供补丁类调用用法提示 |
 | `PushConfigToBackendAsync` | L561-590 | GMCM save 回调 fire-and-forget：POST /config 推送 provider/api_key/model/temperature；成功 HUD 提示，失败 HUD+日志 |
-| `GameStateData`（内部类） | L597 | 发给后端的模型共 14 字段：基础 5（PlayerName/Stamina/GameTime/Location/Message）+ 第一批 5（Season/IsRaining/DayOfMonth/Money/Health）+ 第二批 4（CurrentTool/FarmingLevel/MiningLevel/DaysPlayed） |
+| `GameStateData`（内部类） | L597 | 发给后端的模型共 17 字段：基础 5（PlayerName/Stamina/GameTime/Location/Message）+ 第一批 5（Season/IsRaining/DayOfMonth/Money/Health）+ 第二批 a 4（CurrentTool/FarmingLevel/MiningLevel/DaysPlayed）+ 第二批 b 3（Inventory/NPCAffection/CurrentQuest） |
 | `ChatResponse`（内部类） | L641 | 后端返回模型：Reply/Emotion |
 
 ### C# 端：`ModTemplate/ModConfig.cs`（GMCM 配置模型）
@@ -330,6 +330,7 @@
 - [x] 游戏内输入框自研方案（2026-10-14，v0.9）：F7 中文输入框落地——SMAPI 4 无 TextInput 事件，直连 MonoGame `GameWindow.TextInput`（见踩坑 23）；F7 测试问题池（TestQuestions/_questionIndex）已删除。
 - [ ] 加防连点：思考中重复提问应忽略或排队，别刷一堆请求（F7 和聊天框两个入口都要防）。
 - [x] 扩展状态感知第二批 a（2026-10-14）：CurrentTool / FarmingLevel / MiningLevel / DaysPlayed 全链路（C# GameStateData → Python ChatRequest（带默认值向后兼容）→ chat_node 状态块加工具行（空手不显示，英文名→中文映射）/ 技能等级行 / 存档天数行）。
+- [x] 扩展状态感知第二批 b（2026-10-15）：Inventory / NPCAffection / CurrentQuest 全链路。C#：背包取 `Items` 前10个非空物品 `"名称 x数量"`；好感度遍历 `friendshipData.Pairs` 取好感>0 前8个降序，心数=`Points/250`；任务取 `questLog` 第一个 `!completed.Value` 的 `"标题 - 当前目标"`。Python：ChatRequest 三字段默认 `""` 向后兼容；retrieve_node 把季节/天气/地点拼成 `[春季 晴天 Farm]` 前缀进检索 query；chat_node 状态块加背包/NPC好感/当前任务三行，空值不显示。踩坑：`Quest.completed` 是 `NetBool` 不是 `bool`，必须用 `.Value`。
 - [x] 多轮对话记忆（2026-10-12）：LangGraph 对话图（retrieve → chat）+ Checkpointer，`thread_id=玩家名` 隔离历史；检索/拼提示词/调 LLM 下沉到图节点，main.py 只剩调度。
 - [x] 记忆持久化（2026-10-13）：MemorySaver 换 AsyncSqliteSaver，历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢（同步版 SqliteSaver 不支持 async，见踩坑 19）。
 - [x] 历史长度上限（2026-10-13）：chat_node 只把最近 20 条（`[-21:-1]`，约 10 轮）塞给 LLM，更早历史仍完整留在 SQLite；token 成本可控且不丢数据。
@@ -348,7 +349,7 @@
 - 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `AIpy/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
 - 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
-- 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 14 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/CurrentTool/FarmingLevel/MiningLevel/DaysPlayed/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
+- 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 17 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/CurrentTool/FarmingLevel/MiningLevel/DaysPlayed/Inventory/NPCAffection/CurrentQuest/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
 - 多轮记忆：LangGraph `AsyncSqliteSaver`（SQLite 落盘 `AIpy/data/checkpoints.db`），`thread_id` 用玩家名隔离；重启后端历史不丢，删该文件即清空（见核心机制备忘第 7 条、踩坑 19）。
 - Harmony：dll 在 `D:\Steam\steamapps\common\Stardew Valley\smapi-internal\0Harmony.dll`，csproj 显式引用 + `Private=false`；Entry 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 安装。
 - 编译命令：在 `ModTemplate` 目录下 `dotnet build`。

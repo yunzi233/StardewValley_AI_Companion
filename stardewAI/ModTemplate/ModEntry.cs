@@ -15,6 +15,7 @@
 // ============================================================
 using System;
 using System.Collections.Generic;
+using System.Linq;                     // 背包/好感度汇总用 LINQ 筛选拼接
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
@@ -419,7 +420,29 @@ namespace StardewAIAssistant
                 CurrentTool = Game1.player.CurrentTool?.Name ?? "",
                 FarmingLevel = Game1.player.farmingLevel.Value,     // 耕种技能等级（0-10）
                 MiningLevel = Game1.player.miningLevel.Value,       // 采矿技能等级（0-10）
-                DaysPlayed = (int)Game1.stats.DaysPlayed            // 存档已玩总天数（uint → int）
+                DaysPlayed = (int)Game1.stats.DaysPlayed,            // 存档已玩总天数（uint → int）
+
+                // ========== 【扩展状态感知】第二批 b 新增字段 ==========
+                // 背包：取前 10 个非空物品，格式 "名称 x数量"。Items 是 Inventory（IList<Item>）。
+                Inventory = string.Join(", ",
+                    Game1.player.Items
+                        .Where(it => it != null)
+                        .Take(10)
+                        .Select(it => $"{it.Name} x{it.Stack}")),
+                // NPC 好感度：遍历 friendshipData（NetStringDictionary<Friendship>），
+                // 取好感>0 的前 8 个，心数 = Points / 250（每心 250 点），按好感降序。
+                NPCAffection = string.Join(", ",
+                    Game1.player.friendshipData.Pairs
+                        .Where(p => p.Value.Points > 0)
+                        .OrderByDescending(p => p.Value.Points)
+                        .Take(8)
+                        .Select(p => $"{p.Key}:{p.Value.Points / 250}心")),
+                // 当前任务：取第一个未完成的（completed=false），标题 + 当前目标。
+                // questLog 是 NetObjectList<Quest>，completed 为 false 表示进行中。
+                CurrentQuest = Game1.player.questLog
+                    .FirstOrDefault(q => !q.completed.Value) is { } q
+                        ? $"{q.questTitle} - {q.currentObjective}"
+                        : "",
             };
 
             // 入口标记，方便在 SMAPI 日志里区分是 F7 还是聊天框触发的
@@ -427,7 +450,8 @@ namespace StardewAIAssistant
             this.Monitor.Log(
                 $"[AI伴侣] [{entryTag}] 收集状态：玩家={state.PlayerName}，体力={state.Stamina}，时间={state.GameTime}，地点={state.Location}，" +
                 $"季节={state.Season}，下雨={state.IsRaining}，日期={state.DayOfMonth}号，金币={state.Money}，血量={state.Health}，" +
-                $"工具={state.CurrentTool}，耕种Lv={state.FarmingLevel}，采矿Lv={state.MiningLevel}，已玩天数={state.DaysPlayed}",
+                $"工具={state.CurrentTool}，耕种Lv={state.FarmingLevel}，采矿Lv={state.MiningLevel}，已玩天数={state.DaysPlayed}，" +
+                $"背包={state.Inventory}，NPC好感={state.NPCAffection}，当前任务={state.CurrentQuest}",
                 LogLevel.Info);
             this.Monitor.Log($"[AI伴侣] [{entryTag}] 问题内容：{question}", LogLevel.Info);
 
@@ -632,6 +656,16 @@ namespace StardewAIAssistant
 
             /// <summary>存档已玩总天数（用于"第 N 天"的进度表述）。</summary>
             public int DaysPlayed { get; set; }
+
+            // ========== 【扩展状态感知】第二批 b 新增字段 ==========
+            /// <summary>背包物品汇总（前 10 个非空物品，格式"名称 x数量"，逗号分隔）。</summary>
+            public string Inventory { get; set; } = string.Empty;
+
+            /// <summary>NPC 好感度汇总（好感>0 的前 8 个，格式"NPC名:心数心"，按好感降序）。</summary>
+            public string NPCAffection { get; set; } = string.Empty;
+
+            /// <summary>当前未完成任务的标题与目标，没有则空字符串。</summary>
+            public string CurrentQuest { get; set; } = string.Empty;
         }
 
         /// <summary>

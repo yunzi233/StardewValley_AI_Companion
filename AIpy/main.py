@@ -69,6 +69,11 @@ class ChatRequest(BaseModel):
     MiningLevel: int = 0        # 采矿等级（0-10）
     DaysPlayed: int = 0         # 存档已玩总天数
 
+    # ========== 【扩展状态感知】第二批 b 新增字段 ==========
+    Inventory: str = ""         # 背包物品汇总（"Paragon x5, CopperOre x12"）
+    NPCAffection: str = ""      # NPC 好感度汇总（"Abigail:10心, Leah:8心"）
+    CurrentQuest: str = ""      # 当前未完成任务的标题与目标
+
 
 class ChatResponse(BaseModel):
     reply: str
@@ -143,6 +148,10 @@ async def chat_endpoint(req: ChatRequest):
         "farming_level": req.FarmingLevel,
         "mining_level": req.MiningLevel,
         "days_played": req.DaysPlayed,
+        # 【扩展状态感知】第二批 b 新增字段
+        "inventory": req.Inventory,
+        "npc_affection": req.NPCAffection,
+        "current_quest": req.CurrentQuest,
     }
 
     # 调 LangGraph：retrieve → chat，Checkpointer 自动维护历史

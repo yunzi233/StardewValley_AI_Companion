@@ -23,13 +23,21 @@ def init_agent(llm, retriever, system_prompt):
 
 
 async def retrieve_node(state: State):
-    """检索知识库；用本轮玩家原话做 query。"""
-    # state["messages"][-1] 是本轮输入的 HumanMessage（玩家原话）
-    query = state["messages"][-1].content
+    """检索知识库；用本轮玩家原话 + 当前状态（季节/天气/地点）做 query。"""
+    ps = state["player_state"]
+    current_question = state["messages"][-1].content
+    # 把季节/天气/地点拼进检索 query，提升与状态相关的召回：
+    # 例如玩家只问"钓什么鱼"时，夏季晴天的上下文能帮助召回对应季节/天气的鱼块。
+    season_cn = {"spring": "春季", "summer": "夏季",
+                 "fall": "秋季", "winter": "冬季"}.get(ps.get("season", ""), "")
+    weather = "下雨" if ps.get("is_raining") else "晴天"
+    location = ps.get("location", "")
+    context_tag = " ".join(t for t in [season_cn, weather, location] if t)
+    query = f"[{context_tag}] {current_question}" if context_tag else current_question
     try:
         docs = await _retriever.ainvoke(query)
         context = "\n\n".join(d.page_content for d in docs)
-        print(f"[检索] 召回 {len(docs)} 块")
+        print(f"[检索] query={query!r}，召回 {len(docs)} 块")
         return {"context": context, "error": ""}
     except Exception:
         print(f"[错误] 检索失败：\n{traceback.format_exc()}")
@@ -48,6 +56,10 @@ async def chat_node(state: State):
     tool_cn = {"Axe": "斧头", "Pickaxe": "镐子", "Hoe": "锄头", "WateringCan": "水壶",
                "Scythe": "镰刀"}.get(ps.get("current_tool", ""), ps.get("current_tool", ""))
     tool_line = f"- 工具：{tool_cn}\n" if ps.get("current_tool") else ""
+    # 背包 / NPC 好感 / 当前任务：空值不显示该行
+    inv_line = f"- 背包：{ps.get('inventory', '')}\n" if ps.get("inventory") else ""
+    npc_line = f"- NPC 好感：{ps.get('npc_affection', '')}\n" if ps.get("npc_affection") else ""
+    quest_line = f"- 当前任务：{ps.get('current_quest', '')}\n" if ps.get("current_quest") else ""
 
     # 本轮玩家原话
     current_question = state["messages"][-1].content
@@ -64,6 +76,9 @@ async def chat_node(state: State):
         f"- 时间：{ps['game_time']}\n"
         f"{tool_line}"
         f"- 技能：耕种 Lv.{ps.get('farming_level', 0)} / 采矿 Lv.{ps.get('mining_level', 0)}\n"
+        f"{inv_line}"
+        f"{npc_line}"
+        f"{quest_line}"
         f"- 体力：{ps['stamina']:.0f} / 270\n"
         f"- 血量：{ps['health']} / 100\n"
         f"- 金币：{ps['money']}\n"

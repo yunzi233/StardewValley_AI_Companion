@@ -5,8 +5,8 @@
 """
 from pathlib import Path
 
-# 项目根目录（config.py 在 src/aipy/ 下，上溯两级到 AIpy/）
-# parents[0]=aipy/, parents[1]=src/, parents[2]=AIpy/
+# 项目根目录（config.py 在 src/aipy/ 下，上溯两级到 backend/）
+# parents[0]=aipy/, parents[1]=src/, parents[2]=backend/
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # ---- 向量库 ----
@@ -24,5 +24,5 @@ TOP_K = 3
 WIKI_DATA_DIR = PROJECT_ROOT / "wiki_data"
 
 # ---- 对话历史持久化文件（SQLite，AsyncSqliteSaver）----
-# 放在 AIpy/data/ 下，不要混进 chroma_db/；文件本地生成，已 gitignore
+# 放在 backend/data/ 下，不要混进 chroma_db/；文件本地生成，已 gitignore
 CHECKPOINT_DB = PROJECT_ROOT / "data" / "checkpoints.db"

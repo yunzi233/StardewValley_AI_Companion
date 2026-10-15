@@ -84,9 +84,9 @@
     - 结论：回车先触发 `textBoxEnter(TextBox sender)`，它内部调 `textBoxEnter(string text)`（真正执行命令/聊天发送），**返回后无条件调用 `reset()` + `clickAway()`**。所以 Prefix 只打 string 重载即可：拦截后返回 false 跳过发送，输入框清空和关聊天框由外层自动完成，不用自己收尾。
 
 17. **config.json 的查找路径跟着代码文件走，不跟着启动目录走**
-    - 现象：把 `config.example.json` 复制到 `AIpy/config.json`（项目根），后端照样报 `缺少配置文件`。
-    - 原因：`llm_factory.py` 里写的是 `Path(__file__).parent / "config.json"`，工厂模块在 `src/aipy/`，所以真实配置必须位于 `AIpy/src/aipy/config.json`；而 example 模板放在 `AIpy/` 根目录，复制时目标路径容易写错。
-    - 解决：`cp config.example.json src/aipy/config.json`（在 AIpy/ 下执行）。模板和真实配置不同目录这点要在 README 写醒目。
+    - 现象：把 `config.example.json` 复制到 `backend/config.json`（项目根），后端照样报 `缺少配置文件`。
+    - 原因：`llm_factory.py` 里写的是 `Path(__file__).parent / "config.json"`，工厂模块在 `src/aipy/`，所以真实配置必须位于 `backend/src/aipy/config.json`；而 example 模板放在 `backend/` 根目录，复制时目标路径容易写错。
+    - 解决：`cp config.example.json src/aipy/config.json`（在 backend/ 下执行）。模板和真实配置不同目录这点要在 README 写醒目。
 
 18. **`uv uvicorn` 会被当成 uv 的子命令，必须 `uv run`**
     - 现象：执行 `uv uvicorn main:app --reload` 报 `error: unrecognized subcommand 'uvicorn'`。
@@ -159,7 +159,7 @@
    - `State`（TypedDict）：`messages` 挂 `add_messages` reducer，节点返回的 message 自动**追加**进历史列表；其他字段（player_state/context/error）不挂 reducer，每轮**覆盖**。
    - Checkpointer：`compile(checkpointer=...)` 后，按调用时的 `config={"configurable": {"thread_id": ...}}` 存每个会话的 State 快照——我们用玩家名当 thread_id，天然按角色隔离。
    - 请求入口只放本轮玩家原话 `messages=[HumanMessage(...)]`，历史由 Checkpointer 自动注入；**别自己把历史拼进 messages**，会重复。
-   - 持久化用 `AsyncSqliteSaver` + `aiosqlite.connect(CHECKPOINT_DB)`（懒连接），历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢；想清空记忆就删这个文件（同步版 SqliteSaver 不支持 async，见踩坑 19）。
+   - 持久化用 `AsyncSqliteSaver` + `aiosqlite.connect(CHECKPOINT_DB)`（懒连接），历史落盘 `backend/data/checkpoints.db`，重启后端不丢；想清空记忆就删这个文件（同步版 SqliteSaver 不支持 async，见踩坑 19）。
 
 8. **Mod 间 API 调用（GMCM 集成）**
    - 时序：Entry 执行时其他 Mod 可能还没初始化完，此时 `GetApi` 会返回 null 并触发 SMAPI 警告 `Tried to access a mod-provided API before all mods were initialized.`——必须订阅 `GameLaunched` 事件再调。
@@ -248,7 +248,7 @@
 
 纯状态类：字符接收（`Window.TextInput`）、按键分发（`ButtonPressed`）、HUD 绘制都在 ModEntry.cs。
 
-### Python 端：`AIpy/main.py`（FastAPI 入口 + LangGraph 调度）
+### Python 端：`backend/main.py`（FastAPI 入口 + LangGraph 调度）
 
 | 块 | 位置 | 作用 |
 |---|---|---|
@@ -262,7 +262,7 @@
 | `chat_endpoint` | L101-155 | `/chat` 主流程（检索/拼提示词/调 LLM 已下沉到图节点）：①`thread_id=玩家名`（记忆按角色隔离）②组 `player_state` dict（9 字段）③`graph.ainvoke`（try 包裹，异常返回友好错误）④按 `result["error"]` 分支返回 retrieval_failed / llm_failed 提示 ⑤成功取 `messages[-1].content` 作回复 |
 | `update_config` | L157-184 | `/config` 主流程：校验 provider/api_key/model → `save_config` 写文件 → `create_llm` 重建 → 重新 `init_agent`（不重建 graph，历史保留） |
 
-### Python 端：`AIpy/src/aipy/agent/`（LangGraph 对话图，新增）
+### Python 端：`backend/src/aipy/agent/`（LangGraph 对话图，新增）
 
 `state.py`：
 
@@ -280,7 +280,7 @@
 | `_after_retrieve` | L78-80 | 条件边：`retrieval_failed` 直接 END 跳过 chat，否则进 chat |
 | `build_graph` | L83-102 | `mkdir` 建 `data/` → `aiosqlite.connect(CHECKPOINT_DB)` 懒连接 → `AsyncSqliteSaver` → `StateGraph`：START → retrieve →（条件边）→ chat → END → `compile(checkpointer=...)`，历史落盘 SQLite |
 
-### Python 端：`AIpy/src/aipy/llm_factory.py`（LLM 工厂）
+### Python 端：`backend/src/aipy/llm_factory.py`（LLM 工厂）
 
 | 块 | 位置 | 作用 |
 |---|---|---|
@@ -290,13 +290,13 @@
 | `save_config` | L28-34 | 覆盖写 config.json（UTF-8，缩进 2），供 /config 接口调用 |
 | `create_llm` | L37-62 | `ollama` → `ChatOllama(model, base_url, temperature)`；其他 provider 校验 api_key 非空后返回 `ChatOpenAI(model, api_key, base_url=预设, temperature)`；temperature 读 cfg（默认 0.7，老 config.json 无此字段时兼容） |
 
-### Python 端：`AIpy/src/aipy/config.py`（项目级常量，新建）
+### Python 端：`backend/src/aipy/config.py`（项目级常量，新建）
 
 集中管理原先散落在 main.py 和 build_knowledge_base.py 里的 5 处硬编码，改一处两边同时生效。
 
 | 常量 | 位置 | 作用 |
 |---|---|---|
-| `PROJECT_ROOT` | L10 | `Path(__file__).resolve().parents[2]` → `AIpy/` 根目录 |
+| `PROJECT_ROOT` | L10 | `Path(__file__).resolve().parents[2]` → `backend/` 根目录 |
 | `CHROMA_DIR` | L13 | `PROJECT_ROOT / "chroma_db"`，向量库持久化目录 |
 | `COLLECTION_NAME` | L14 | `"stardew_wiki"`，Chroma 集合名（main.py 和建库脚本必须一致） |
 | `EMBEDDING_MODEL` / `OLLAMA_BASE_URL` | L17-18 | `"bge-m3"` / `http://127.0.0.1:11434`，嵌入模型固定走本地 Ollama |
@@ -304,7 +304,7 @@
 | `WIKI_DATA_DIR` | L24 | `PROJECT_ROOT / "wiki_data"`，知识库源 Markdown 目录 |
 | `CHECKPOINT_DB` | L28 | `PROJECT_ROOT / "data" / "checkpoints.db"`，对话历史 SQLite 文件（AsyncSqliteSaver 落盘用，已 gitignore） |
 
-### Python 端：`AIpy/src/aipy/build_knowledge_base.py`（建库脚本）
+### Python 端：`backend/src/aipy/build_knowledge_base.py`（建库脚本）
 
 | 块 | 位置 | 作用 |
 |---|---|---|
@@ -332,7 +332,7 @@
 - [x] 扩展状态感知第二批 a（2026-10-14）：CurrentTool / FarmingLevel / MiningLevel / DaysPlayed 全链路（C# GameStateData → Python ChatRequest（带默认值向后兼容）→ chat_node 状态块加工具行（空手不显示，英文名→中文映射）/ 技能等级行 / 存档天数行）。
 - [x] 扩展状态感知第二批 b（2026-10-15）：Inventory / NPCAffection / CurrentQuest 全链路。C#：背包取 `Items` 前10个非空物品 `"名称 x数量"`；好感度遍历 `friendshipData.Pairs` 取好感>0 前8个降序，心数=`Points/250`；任务取 `questLog` 第一个 `!completed.Value` 的 `"标题 - 当前目标"`。Python：ChatRequest 三字段默认 `""` 向后兼容；retrieve_node 把季节/天气/地点拼成 `[春季 晴天 Farm]` 前缀进检索 query；chat_node 状态块加背包/NPC好感/当前任务三行，空值不显示。踩坑：`Quest.completed` 是 `NetBool` 不是 `bool`，必须用 `.Value`。
 - [x] 多轮对话记忆（2026-10-12）：LangGraph 对话图（retrieve → chat）+ Checkpointer，`thread_id=玩家名` 隔离历史；检索/拼提示词/调 LLM 下沉到图节点，main.py 只剩调度。
-- [x] 记忆持久化（2026-10-13）：MemorySaver 换 AsyncSqliteSaver，历史落盘 `AIpy/data/checkpoints.db`，重启后端不丢（同步版 SqliteSaver 不支持 async，见踩坑 19）。
+- [x] 记忆持久化（2026-10-13）：MemorySaver 换 AsyncSqliteSaver，历史落盘 `backend/data/checkpoints.db`，重启后端不丢（同步版 SqliteSaver 不支持 async，见踩坑 19）。
 - [x] 历史长度上限（2026-10-13）：chat_node 只把最近 20 条（`[-21:-1]`，约 10 轮）塞给 LLM，更早历史仍完整留在 SQLite；token 成本可控且不丢数据。
 - [x] 游戏内配置界面（GMCM，2026-10-14）：C# 端 `ModConfig.cs` + `RegisterGmcmConfig`（GameLaunched 事件），Python 端 `POST /config` + `save_config` + `PlaceholderLLM`；配置改完无需重启后端，对话历史保留。
 - [x] 模型参数可配置（2026-10-14）：temperature 全链路打通——C# `ModConfig.Temperature` + GMCM `AddNumberOption`（0.0-2.0 步长 0.1）→ `POST /config`（校验 0.0-2.0）→ `save_config` 落盘 → `create_llm` 读 cfg 重建 LLM 实时生效；检索 top-k 已挪进 `aipy/config.py`（2026-10-12）。
@@ -343,18 +343,18 @@
 
 ## 五、环境备忘
 
-- Python 后端目录：`D:\AI_Projects\AIpy`（与本 Mod 同一个根仓库），入口 `main.py`，FastAPI + uvicorn，uv 管理依赖，Python >=3.11。
+- Python 后端目录：`D:\StardewValley_AI_Companion\backend`（与本 Mod 同一个根仓库），入口 `main.py`，FastAPI + uvicorn，uv 管理依赖，Python >=3.11。
 - Ollama 模型：嵌入固定用 `bge-m3`（必装，RAG 向量化）；对话模型本地模式用 `qwen2.5:3b`，云端模式不需要本地对话模型，两个模型都要先 `ollama pull`。
-- LLM 配置：真实配置文件是 `AIpy/src/aipy/config.json`（⚠️ 不在项目根），模板 `AIpy/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
+- LLM 配置：真实配置文件是 `backend/src/aipy/config.json`（⚠️ 不在项目根），模板 `backend/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
 - 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
-- 建知识库：在 `AIpy/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
-- 启动：在 `D:\AI_Projects\AIpy` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
+- 建知识库：在 `backend/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
+- 启动：在 `D:\StardewValley_AI_Companion\backend` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
 - 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 17 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/CurrentTool/FarmingLevel/MiningLevel/DaysPlayed/Inventory/NPCAffection/CurrentQuest/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
-- 多轮记忆：LangGraph `AsyncSqliteSaver`（SQLite 落盘 `AIpy/data/checkpoints.db`），`thread_id` 用玩家名隔离；重启后端历史不丢，删该文件即清空（见核心机制备忘第 7 条、踩坑 19）。
+- 多轮记忆：LangGraph `AsyncSqliteSaver`（SQLite 落盘 `backend/data/checkpoints.db`），`thread_id` 用玩家名隔离；重启后端历史不丢，删该文件即清空（见核心机制备忘第 7 条、踩坑 19）。
 - Harmony：dll 在 `D:\Steam\steamapps\common\Stardew Valley\smapi-internal\0Harmony.dll`，csproj 显式引用 + `Private=false`；Entry 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 安装。
 - 编译命令：在 `ModTemplate` 目录下 `dotnet build`。
 - 只验证语法不部署：`dotnet build -p:EnableModDeploy=false -p:EnableModZip=false`。
-- DLL 输出：`d:\AI_Projects\stardewAI\ModTemplate\bin\Debug\net6.0\StardewAIAssistant.dll`。
+- DLL 输出：`d:\StardewValley_AI_Companion\mod\ModTemplate\bin\Debug\net6.0\StardewAIAssistant.dll`。
 - 游戏路径：`D:\Steam\steamapps\common\Stardew Valley`。
 - Mods 目录：`D:\Steam\steamapps\common\Stardew Valley\Mods\StardewAIAssistant`（build 后自动复制，游戏开着会失败）。
 - 版本：项目 net6.0；游戏 1.6.15；SMAPI MinimumApiVersion 4.0.0；NuGet `Pathoschild.Stardew.ModBuildConfig` 4.1.0。

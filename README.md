@@ -62,12 +62,12 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 
 **关键设计**：
 - **双入口复用同一套后端流程**：聊天框提问经 Harmony 补丁（`ChatBox.textBoxEnter(string)` 的 Prefix）截获，`"AI "` 前缀才拦截，其他消息原样放行；F7 测试问题池逻辑独立保留
-- **LLM 工厂模式**：[llm_factory.py](AIpy/src/aipy/llm_factory.py) 启动时读 `config.json`，按 `provider` 创建 `ChatOllama` 或 `ChatOpenAI`（四个云端厂商的 base_url 已内置预设）；嵌入模型始终用本地 Ollama 的 bge-m3，与对话模型选型无关
+- **LLM 工厂模式**：[llm_factory.py](backend/src/aipy/llm_factory.py) 启动时读 `config.json`，按 `provider` 创建 `ChatOllama` 或 `ChatOpenAI`（四个云端厂商的 base_url 已内置预设）；嵌入模型始终用本地 Ollama 的 bge-m3，与对话模型选型无关
 - **游戏内配置（GMCM）**：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# 推送到后端 `POST /config` → 写 `config.json` + 重建 LLM 注入对话图，无需重启；后端未启动时配置只存本地 ModConfig.json，启动后需重新保存
 - `await` 之后的代码运行在线程池后台线程，所有 UI 操作（HUD / 聊天框）通过主线程任务队列（`Queue<Action>` + `UpdateTicked`）调度回游戏主线程执行，避免随机崩溃
 - 全局复用单个 `HttpClient`，15 秒超时，请求期间游戏照常运行不卡顿
 - 向量库在后端启动时只加载一次；每次请求先做向量检索（top-3），把参考资料片段和游戏状态一起注入提示词
-- **多轮记忆**：`/chat` 请求进入 LangGraph 对话图（`retrieve → chat` 两个节点），对话历史由 `add_messages` reducer 自动累积、`AsyncSqliteSaver` 按 `thread_id`（玩家名）落盘到 `AIpy/data/checkpoints.db`——重启后端历史不丢；删掉该文件即可清空全部记忆
+- **多轮记忆**：`/chat` 请求进入 LangGraph 对话图（`retrieve → chat` 两个节点），对话历史由 `add_messages` reducer 自动累积、`AsyncSqliteSaver` 按 `thread_id`（玩家名）落盘到 `backend/data/checkpoints.db`——重启后端历史不丢；删掉该文件即可清空全部记忆
 - System Prompt 严格约束：游戏知识必须依据参考资料回答，资料里没有就直说"我不太清楚"；向量检索不擅长的逻辑条件（如"晴天"误召回"雨天"鱼）交给 LLM 二次筛选
 - 未进入存档时发起对话会友好提示，不会崩溃
 
@@ -75,7 +75,7 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 
 ```
 AI_Projects/
-├── AIpy/                      # Python AI 后端
+├── backend/                      # Python AI 后端
 │   ├── main.py                # 入口：FastAPI + LangGraph 对话图调度，POST /chat + POST /config
 │   ├── config.example.json    # LLM 配置模板（随仓库分发，真实 config.json 已 gitignore）
 │   ├── pyproject.toml         # uv 依赖管理
@@ -92,7 +92,7 @@ AI_Projects/
 │   │   └── build_knowledge_base.py  # 建库脚本：wiki_data → chroma_db
 │   ├── data/                  # 对话历史 SQLite（checkpoints.db，本地生成，已 gitignore）
 │   └── chroma_db/             # 向量库（脚本本地生成，已 gitignore）
-├── stardewAI/                 # C# SMAPI Mod
+├── mod/                 # C# SMAPI Mod
 │   ├── ModTemplate/
 │   │   ├── ModEntry.cs        # Mod 入口：F7/聊天框两条对话流程、GMCM 配置、浮动精灵、线程队列、HTTP 请求
 │   │   ├── ChatBoxTextBoxEnterPatch.cs  # Harmony 补丁：拦截聊天框 "AI " 消息
@@ -144,10 +144,10 @@ AI_Projects/
    ollama pull bge-m3
    ```
    （嵌入模型固定走本地 Ollama，与对话模型的选型无关）
-4. **GMCM 前置 dll**：把 `GenericModConfigMenu.dll` 复制到 `stardewAI/ModTemplate/libs/`（详见下文"编译并部署 Mod"）
+4. **GMCM 前置 dll**：把 `GenericModConfigMenu.dll` 复制到 `mod/ModTemplate/libs/`（详见下文"编译并部署 Mod"）
 5. **构建知识库**：
    ```bash
-   cd AIpy
+   cd backend
    uv run python src/aipy/build_knowledge_base.py
    ```
 
@@ -158,7 +158,7 @@ AI_Projects/
 | 文件 | 位置 | 用途 | 谁写 |
 |---|---|---|---|
 | `ModConfig.json` | `Mods/StardewAIAssistant/`（游戏侧） | 游戏读取，决定推送给后端的配置 | GMCM 保存时自动写入 |
-| `config.json` | `AIpy/src/aipy/`（后端侧） | 后端读取，决定用哪个 LLM | 后端收到推送后自动写入 |
+| `config.json` | `backend/src/aipy/`（后端侧） | 后端读取，决定用哪个 LLM | 后端收到推送后自动写入 |
 
 **首次配置流程**：
 1. 启动 Python 后端（`uv run uvicorn main:app --reload --port 8000`）
@@ -200,14 +200,14 @@ Ollama 安装后一般会自动在后台运行（默认端口 `11434`）；若�
 
 ### 2. 准备知识库（首次必做）
 
-知识库源文件放在 `AIpy/wiki_data/`，为 **UTF-8 编码的 Markdown**：
+知识库源文件放在 `backend/wiki_data/`，为 **UTF-8 编码的 Markdown**：
 
 - 建库脚本按 `##`（二级标题）切块，**每个 `##` 小节成为一个 chunk**
 - 每个 chunk 必须自包含：标题里的限定信息（如"春季作物""XX 的礼物偏好"）要留在正文中，不能只写一个孤立的"# 春季作物"
 - 玩家可能提问的关键词（如"礼物""晴天"）应直接出现在对应 chunk 的标题或正文里，否则向量检索召不回
-- 现有三份：[crops.md](AIpy/wiki_data/crops.md)（作物）、[fish.md](AIpy/wiki_data/fish.md)（鱼类）、[gift.md](AIpy/wiki_data/gift.md)（NPC 礼物），可直接照格式扩充
+- 现有三份：[crops.md](backend/wiki_data/crops.md)（作物）、[fish.md](backend/wiki_data/fish.md)（鱼类）、[gift.md](backend/wiki_data/gift.md)（NPC 礼物），可直接照格式扩充
 
-运行建库脚本（在 `AIpy/` 目录下）：
+运行建库脚本（在 `backend/` 目录下）：
 
 ```bash
 uv sync                                                      # 首次安装依赖
@@ -236,12 +236,12 @@ uv run python src/aipy/build_knowledge_base.py
 
 **方式二：手动编辑配置文件（无 GMCM 时）**
 
-后端启动时从 **`src/aipy/config.json`** 读取对话模型配置。仓库只提供模板 [config.example.json](AIpy/config.example.json)，真实配置含 API Key，已加入 `.gitignore` 不会被提交。
+后端启动时从 **`src/aipy/config.json`** 读取对话模型配置。仓库只提供模板 [config.example.json](backend/config.example.json)，真实配置含 API Key，已加入 `.gitignore` 不会被提交。
 
 把模板复制到 `src/aipy/` 下并改名（⚠️ 注意目标位置在 `src/aipy/`，不是项目根目录——工厂按自己所在目录找 config.json）：
 
 ```bash
-# 在 AIpy/ 目录下
+# 在 backend/ 目录下
 cp config.example.json src/aipy/config.json
 ```
 
@@ -267,14 +267,14 @@ cp config.example.json src/aipy/config.json
 }
 ```
 
-- `provider` 可选：`ollama` / `deepseek` / `zhipu` / `qwen` / `kimi`，云端四家的接口地址已在 [llm_factory.py](AIpy/src/aipy/llm_factory.py) 内置预设，不用自己填 base_url
+- `provider` 可选：`ollama` / `deepseek` / `zhipu` / `qwen` / `kimi`，云端四家的接口地址已在 [llm_factory.py](backend/src/aipy/llm_factory.py) 内置预设，不用自己填 base_url
 - 各家模型名填对应官方文档的型号（如智谱 `glm-4-flash`、通义 `qwen-plus`、Kimi `moonshot-v1-8k`）
 - 缺少 config.json 或云端模式没填 Key：后端**仍能启动**（用 PlaceholderLLM 占位，回复提示"请先在游戏里配置"），收到 GMCM 推送后自动切换为真实模型
 
 ### 4. 启动 AI 后端
 
 ```bash
-cd AIpy
+cd backend
 uv run uvicorn main:app --port 8000      # 启动服务（调试可加 --reload）
 ```
 
@@ -285,12 +285,12 @@ uv run uvicorn main:app --port 8000      # 启动服务（调试可加 --reload�
 ### 5. 编译并部署 Mod
 
 ```bash
-cd stardewAI/ModTemplate
+cd mod/ModTemplate
 dotnet build
 ```
 
-- 编译前请修改 [StardewAIAssistant.csproj](stardewAI/ModTemplate/StardewAIAssistant.csproj) 中的 `GamePath` 为你的游戏安装路径
-- **首次编译前需准备 GMCM 前置 dll**：从 [GenericModConfigMenu 发布页](https://www.nexusmods.com/stardewvalley/mods/5098)下载并解压，把 `GenericModConfigMenu.dll` 放到 `stardewAI/ModTemplate/libs/` 下（该 dll 不入库；`libs/IGenericModConfigMenuApi.cs` 接口文件已随仓库提供，取自 GMCM 仓库 `shared/` 稳定版）
+- 编译前请修改 [StardewAIAssistant.csproj](mod/ModTemplate/StardewAIAssistant.csproj) 中的 `GamePath` 为你的游戏安装路径
+- **首次编译前需准备 GMCM 前置 dll**：从 [GenericModConfigMenu 发布页](https://www.nexusmods.com/stardewvalley/mods/5098)下载并解压，把 `GenericModConfigMenu.dll` 放到 `mod/ModTemplate/libs/` 下（该 dll 不入库；`libs/IGenericModConfigMenuApi.cs` 接口文件已随仓库提供，取自 GMCM 仓库 `shared/` 稳定版）
 - build 成功后 DLL 会**自动复制**到 `Mods/StardewAIAssistant` 目录
 - ⚠️ 游戏/SMAPI 开着时 build 会因 DLL 被占用而失败，请先关闭游戏
 - 只想验证语法、不部署：`dotnet build -p:EnableModDeploy=false -p:EnableModZip=false`
@@ -390,7 +390,7 @@ dotnet build
 - [x] 扩充状态感知（第二批 a，2026-10-14）：当前工具 / 耕种 / 采矿等级 / 存档天数
 - [ ] 防连点：思考中重复提问应忽略或排队
 - [x] 扩充状态感知（第二批 b，2026-10-15）：背包、NPC 好感、当日任务；并让季节/天气参与检索 query
-- [x] 多轮对话记忆：LangGraph 对话图 + AsyncSqliteSaver（SQLite 落盘 `AIpy/data/checkpoints.db`），按玩家名隔离历史，重启后端不丢
+- [x] 多轮对话记忆：LangGraph 对话图 + AsyncSqliteSaver（SQLite 落盘 `backend/data/checkpoints.db`），按玩家名隔离历史，重启后端不丢
 - [ ] F7 / `AI ` 前缀改为可配置，避免与其他 Mod 冲突
 - [ ] `emotion` 字段驱动机器人表情 / 立绘变化
 
@@ -401,21 +401,21 @@ dotnet build
 | 后端启动日志显示 `[LLM] 未配置...` | 正常现象——等你在游戏里 GMCM 配置完会自动切换；或手动 `cp config.example.json src/aipy/config.json` 后重启（⚠️ 必须放在 `src/aipy/` 下，放项目根目录不生效） |
 | 云端模式报 401 / 认证失败 | API Key 没填、填错或欠费；检查 `src/aipy/config.json` 的 `api_key` 与 `model` 名称；或检查 GMCM 里填的 Key 是否含空格 |
 | 手动改了 config.json 没反应 | 手动改的配置只在后端启动时读取。**推荐用游戏内 GMCM 保存**（走 `/config` 接口热更新，无需重启） |
-| AI 回复驴唇不对马嘴 / 像串了别人的对话 | 多轮记忆按玩家名（thread_id）隔离：改了角色名 = 新会话；测试残留的旧历史会一直保留，想让 AI"失忆"就删 `AIpy/data/checkpoints.db` 后重启后端 |
+| AI 回复驴唇不对马嘴 / 像串了别人的对话 | 多轮记忆按玩家名（thread_id）隔离：改了角色名 = 新会话；测试残留的旧历史会一直保留，想让 AI"失忆"就删 `backend/data/checkpoints.db` 后重启后端 |
 | `uv uvicorn` 报 `unrecognized subcommand` | 少了 `run`，正确命令是 `uv run uvicorn main:app --port 8000` |
 | 输入 `AI 问题` 被当成普通聊天发出去 | Harmony 补丁未生效：看 SMAPI 启动日志有无补丁加载记录；确认 `dotnet build` 后 Mods 目录 DLL 已更新 |
 | HUD 提示「AI大脑连接失败」 | Python 后端未启动或端口不是 8000，先启动后端 |
 | 后端日志报 Ollama 连接错误 | Ollama 服务未运行（默认端口 11434），执行 `ollama serve`。注意：用云端对话模型时也仍需 Ollama 提供 bge-m3 嵌入 |
 | 后端启动报找不到 `chroma_db` / 集合为空 | 还没建知识库，先跑 `uv run python src/aipy/build_knowledge_base.py` |
 | 建库时报 `model "bge-m3" not found` | 嵌入模型没拉取，执行 `ollama pull bge-m3` |
-| 检索结果答非所问 | 检查 wiki 对应 chunk 是否自包含、是否含玩家提问的关键词；向量检索不懂逻辑条件，靠 LLM 二次筛选，详见 [NOTES.md](stardewAI/NOTES.md) |
+| 检索结果答非所问 | 检查 wiki 对应 chunk 是否自包含、是否含玩家提问的关键词；向量检索不懂逻辑条件，靠 LLM 二次筛选，详见 [NOTES.md](mod/NOTES.md) |
 | 本地模型首次回复很慢 | 首次调用需把对话/嵌入模型加载进内存/显存，属正常现象；可先 `ollama run qwen2.5:3b` 预热，嫌慢可切换云端 provider |
 | 改了 C# 代码游戏里没生效 | 忘记 `dotnet build`，游戏跑的还是 Mods 目录里的旧 DLL |
 | HUD 提示「响应超时」 | 后端卡住超过 15 秒，检查后端控制台日志 |
 | `dotnet build` 报 `UnauthorizedAccessException` | 游戏/SMAPI 正在运行占用 DLL，先关闭游戏 |
 | 游戏内 HUD 文字无法自定义颜色 | 游戏本体 1.6.15 移除了 `HUDMessage.color`，错误提示改用 `error_type` 图标；聊天框消息不受此限制（可用 Color 上色） |
 
-更多踩坑细节（反射查 API、沙箱限制、C# 与 C++ 差异等）见 [stardewAI/NOTES.md](stardewAI/NOTES.md)。
+更多踩坑细节（反射查 API、沙箱限制、C# 与 C++ 差异等）见 [mod/NOTES.md](mod/NOTES.md)。
 
 ## 开源协议
 
@@ -424,7 +424,7 @@ dotnet build
 | 部分 | 协议 | 说明 |
 |---|---|---|
 | 源代码（C# / Python） | **MIT** | 可自由使用、修改、分发 |
-| `AIpy/wiki_data/` 下的知识库数据 | **CC BY-NC-SA 4.0** | 来源于星露谷 Wiki，遵循原协议 |
+| `backend/wiki_data/` 下的知识库数据 | **CC BY-NC-SA 4.0** | 来源于星露谷 Wiki，遵循原协议 |
 | 引用的第三方库 | 各自原协议 | 见 `THIRD_PARTY_LICENSES.txt` |
 
 **简单说**：你可以随便用、改、分享这个项目的代码，但不能把基于 wiki 数据的功能用于商业用途。

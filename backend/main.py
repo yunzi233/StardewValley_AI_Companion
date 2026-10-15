@@ -111,6 +111,8 @@ print("向量库加载完成")
 # ========== 对话模型 ==========
 # config.json 不存在或格式错时用 PlaceholderLLM 启动，不阻塞后端；
 # 玩家在游戏里通过 GMCM 保存配置后，/config 接口会重建真实 LLM。
+# _config 先兜底为空 dict：未配置启动时该变量也始终存在，/health 读取不会 NameError。
+_config: dict = {}
 try:
     _config = load_config()
     llm = create_llm(_config)
@@ -125,6 +127,21 @@ except Exception as e:
 init_agent(llm=llm, retriever=retriever, system_prompt=SYSTEM_PROMPT)
 
 # ========== 接口 ==========
+@app.get("/health")
+async def health_check():
+    """健康检查：极快返回——不触发检索、不调用 LLM、不读磁盘、不发网络请求。
+       供 C# 启动时检测后端是否就绪、LLM 是否已配置；
+       下一步"自动拉起后端 + 轮询等待就绪"会复用本接口。"""
+    llm_configured = not isinstance(llm, PlaceholderLLM)
+    return {
+        "status": "ok",
+        "llm_configured": llm_configured,
+        # 注意：/config 推送成功后只重建全局 llm、不回写 _config，
+        # 因此运行中切换配置后 provider 字段可能滞后，仅供 C# 日志参考。
+        "provider": _config.get("provider", "") if llm_configured else "",
+    }
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
     print(f"[收到] {req.PlayerName} / 体力 {req.Stamina} / 时间 {req.GameTime} / {req.Location} / Message={req.Message!r}")

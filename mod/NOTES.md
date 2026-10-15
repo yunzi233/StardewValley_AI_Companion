@@ -139,6 +139,12 @@
     - 附带：默认缓存目录是 `tempfile.gettempdir()/fastembed_cache`（即系统临时目录），**可能被清理工具清掉**，之后首次检索会重新下载。后续打包（路线 2）宜把缓存固定到后端目录，避免玩家侧反复下载。
     - 附带：重建向量库前必须先停掉运行中的后端——旧 `chroma_db/*.bin` 被占用时 `shutil.rmtree` 直接报 `PermissionError [WinError 32]`。
 
+26. **SMAPI 4 没有 `GameLoop.Exiting` 事件（3.x 的 API 被 4.0 移除），退出钩子要用 `AppDomain.ProcessExit`**
+    - 现象：照旧文档写 `helper.Events.GameLoop.Exiting += ...` + `ExitingEventArgs`，编译报 CS0246 找不到 `ExitingEventArgs`。
+    - 根因：SMAPI 4.0 移除了该事件（旧版它就触发不稳定）。用 Mono.Cecil 反射 `StardewModdingAPI.dll` 确认：`IGameLoopEvents` 全部事件里没有任何 Exit 类事件，整个程序集的 `*EventArgs` 里也没有 `ExitingEventArgs`；只剩内部方法 `SGame.OnExiting`（MonoGame `Game.OnExiting` 的重写，Mod 无法订阅）。
+    - 解决：`AppDomain.CurrentDomain.ProcessExit += OnProcessExiting`——窗口关闭 / 游戏菜单退出等正常退出路径都会在 CLR 关闭前触发；注意两点：① 处理函数有约 2 秒时限，只做 `Kill(entireProcessTree:true)`（毫秒级）够用；② 任务管理器强杀 / 崩溃时不触发（旧 `GameLoop.Exiting` 同样不保证，可接受）。
+    - 附带：反射 SMAPI 程序集别用 `Assembly.LoadFrom` + `GetTypes()`（缺依赖抛 ReflectionTypeLoadException），用游戏自带的 `smapi-internal\Mono.Cecil.dll` 的 `ModuleDefinition.ReadModule` 读类型/事件最稳。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -205,12 +211,14 @@
 | `_companion` | L80 | 浮动精灵实例（见 FloatingCompanion.cs 小节） |
 | `_inputBox` | L87 | 中文输入框实例（见 ChineseInputBox.cs 小节） |
 | `_robotTexture` | L93 | 精灵贴图（启动时 ModContent.Load 加载，失败保持 null 走方块占位） |
-| `Entry` | L95-151 | 启动时跑一次：单例保存 → `ReadConfig<ModConfig>()` → `Harmony.PatchAll()` → ModContent.Load 精灵贴图（try-catch 兜底）→ 订阅 ButtonPressed/UpdateTicked/GameLaunched/RenderedWorld/RenderedHud |
-| `OnGameLaunched` | L153-164 | GameLaunched 事件处理：RegisterGmcmConfig + 订阅 `Game1.game1.Window.TextInput`（中文 IME 唯一入口，见踩坑 23） |
+| `_backendProcess` | L114 | 自己拉起的后端进程（null=本会话没拉起过）；退出钩子按它 Kill，不碰玩家手动启动的后端 |
+| `_backendProcessLock` | L117 | 保护 `_backendProcess` 的锁（启动协程与退出钩子可能在不同线程） |
+| `Entry` | L119-176 | 启动时跑一次：单例保存 → `ReadConfig<ModConfig>()` → `Harmony.PatchAll()` → ModContent.Load 精灵贴图（try-catch 兜底）→ 订阅 ButtonPressed/UpdateTicked/GameLaunched/**ProcessExit**/RenderedWorld/RenderedHud |
+| `OnGameLaunched` | L178-196 | GameLaunched 事件处理：RegisterGmcmConfig + 订阅 `Game1.game1.Window.TextInput`（中文 IME 唯一入口，见踩坑 23）+ fire-and-forget `EnsureBackendReadyAsync`（启动保障流程） |
 | `OnRenderedWorld` | L170-174 | 每帧世界绘制完成后：`_companion.Update()` + `_companion.Draw(e.SpriteBatch)` |
 | `OnWindowTextInput` | L182-186 | MonoGame 原生文本输入回调：`IsOpen && !char.IsControl(e.Character)` 才 Append（中文 IME 上屏逐字触发） |
 | `OnRenderedHud` | L193-201 | 输入框打开时屏幕底部画 `输入框：<文本>_`（`Game1.smallFont`，占位样式） |
-| `RegisterGmcmConfig` | L208-282 | GetApi → Register + AddTextOption×3 + AddNumberOption（回答温度 0.0-2.0 步长 0.1）；save 回调写 JSON + fire-and-forget 推送后端；try-catch 兜底 |
+| `RegisterGmcmConfig` | L224-330 | GetApi → Register + AddTextOption×4（Provider/ApiKey/Model/BackendDir）+ AddNumberOption（回答温度 0.0-2.0 步长 0.1）+ AddBoolOption（AutoStartBackend）；save 回调写 JSON + fire-and-forget 推送后端；try-catch 兜底 |
 | `OnButtonPressed` | L285-324 | F7 开关输入框；打开期间 `Helper.Input.Suppress` 吃掉所有按键 → Enter 提交（复用 `HandleAiChatQuestion`）/ Esc 关闭 / Back 删除末尾字符 |
 | `OnUpdateTicked` | L329 | 主线程每帧执行，消费 `_mainThreadActions` 队列 |
 | `EnqueueHudMessage` | L357 | 把显示 HUD 的动作打包入队（可在后台线程调） |
@@ -222,6 +230,12 @@
 | `PushConfigToBackendAsync` | L561-590 | GMCM save 回调 fire-and-forget：POST /config 推送 provider/api_key/model/temperature；成功 HUD 提示，失败 HUD+日志 |
 | `GameStateData`（内部类） | L597 | 发给后端的模型共 17 字段：基础 5（PlayerName/Stamina/GameTime/Location/Message）+ 第一批 5（Season/IsRaining/DayOfMonth/Money/Health）+ 第二批 a 4（CurrentTool/FarmingLevel/MiningLevel/DaysPlayed）+ 第二批 b 3（Inventory/NPCAffection/CurrentQuest） |
 | `ChatResponse`（内部类） | L641 | 后端返回模型：Reply/Emotion |
+| `CheckBackendHealthAsync` | L605 附近 | internal，GET `/health`（3 秒 CTS 超时）→ `(ok, llmConfigured)`；任何异常=不可达；"自动拉起轮询"复用同一方法 |
+| `EnsureBackendReadyAsync` | L671-712 | 启动保障流程：健康检查 → 可达按 LLM 配置提示；不可达分三种（自动启动关闭 / BackendDir 空 / 有效）→ `StartBackendAsync` → 就绪后复查 LLM 给上线提示 |
+| `StartBackendAsync` | L719-799 | 校验目录 → `ProcessStartInfo`（FileName=uv，`uv run uvicorn main:app --port 8000`，重定向输出，CreateNoWindow）→ 记入 `_backendProcess` → 双流读日志落 `backend.log` → 轮询 `/health` 每秒一次最多 30 次；uv 不在 PATH / 进程早退 / 超时都有对应 HUD 提示 |
+| `PumpStreamAsync` | L806-825 | 后台泵：逐行读进程 stdout/stderr 写 `backend.log`（AutoFlush）。必须读流——重定向后不读，管道缓冲区写满会把 Python 卡死 |
+| `OnProcessExiting` | L833-850 | `AppDomain.ProcessExit` 钩子（SMAPI 4 无 GameLoop.Exiting，见踩坑 26）：Kill 自己拉起的后端进程树，约 2 秒时限只做快操作 |
+| `HealthResponse`（内部类） | ChatResponse 前 | `/health` 返回模型：Status + `llm_configured`（snake_case 必须显式 `[JsonPropertyName]`，大小写不敏感选项不忽略下划线） |
 
 ### C# 端：`ModTemplate/ModConfig.cs`（GMCM 配置模型）
 
@@ -231,6 +245,8 @@
 | `ApiKey` | L10 | 云端厂商 API Key；本地 Ollama 留空 |
 | `Model` | L13 | 模型名，默认 deepseek-chat |
 | `Temperature` | L16 | 回答温度 0.0-2.0（默认 0.7），GMCM 数值选项 |
+| `BackendDir` | L19 | backend 目录绝对路径（含 main.py 的文件夹），自动拉起后端用；留空不拉起 |
+| `AutoStartBackend` | L22 | 游戏启动时是否自动拉起后端（默认 true，需 BackendDir 已填） |
 
 ### C# 端：`ModTemplate/ChatBoxTextBoxEnterPatch.cs`（Harmony 补丁）
 
@@ -369,7 +385,8 @@
 - [ ] 主动提醒：不对话时 AI 偶尔主动提示玩家（触发机制待定，如体力低 / 节日 / 任务到期）。
 - [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求。
 - [x] 嵌入改本地 ONNX（2026-10-15）：`OllamaEmbeddings`(bge-m3, 1024 维) → `FastEmbedEmbeddings`(`BAAI/bge-small-zh-v1.5`, 512 维, int8 ~23MB)；新增 `aipy/embeddings.py` 封装，`config.py` 换模型常量并移除 `OLLAMA_BASE_URL`，`chroma_db/` 全量重建；经 5 组问题验证检索质量（鱼类/礼物命中准确，季节类问题受 KB 结构限制）。
-- [ ] 面向玩家打包（当前优先级，路线 2）：PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖。
+- [x] 后端生命周期打通（2026-10-15）：Python 端 `GET /health`（不触发检索/LLM，返回 status/llm_configured/provider；`_config` 兜底空 dict 防 NameError）；C# 端 `CheckBackendHealthAsync`（3 秒超时）→ `EnsureBackendReadyAsync`（可达提示 / 不可达按 GMCM 配置自动拉起）→ `StartBackendAsync`（uv 拉起 + 双流写 backend.log + 轮询 30 秒）→ 退出钩子 `AppDomain.ProcessExit` Kill 进程树（SMAPI 4 无 GameLoop.Exiting，见踩坑 26）；GMCM 新增 BackendDir / AutoStartBackend 两配置项。
+- [ ] 面向玩家打包（当前优先级，路线 2）：PyInstaller 打包 exe + 随包分发后端做到玩家零环境依赖（自动拉起 + /health 就绪检测已完成，下一步把"拉起 uv"换成"拉起打包好的 exe"）。
 
 ## 五、环境备忘
 
@@ -378,8 +395,8 @@
 - LLM 配置：真实配置文件是 `backend/src/aipy/config.json`（⚠️ 不在项目根），模板 `backend/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
 - 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `backend/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
-- 启动：在 `D:\StardewValley_AI_Companion\backend` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）。
-- 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 17 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/CurrentTool/FarmingLevel/MiningLevel/DaysPlayed/Inventory/NPCAffection/CurrentQuest/Message；返回小写 `{"reply":..., "emotion":...}`。改字段两头要一起改，且改完 C# 别忘了重新 build。
+- 启动：两种方式——① 手动：在 `D:\StardewValley_AI_Companion\backend` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）；② 自动：GMCM 填 BackendDir + 开 AutoStartBackend，进游戏 C# 自动用 uv 拉起（日志落 `backend/backend.log`，游戏退出时自动关闭）。
+- 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 17 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/CurrentTool/FarmingLevel/MiningLevel/DaysPlayed/Inventory/NPCAffection/CurrentQuest/Message；返回小写 `{"reply":..., "emotion":...}`。另有 `GET /health`（启动检测用，零开销：不检索不调 LLM，返回 `{"status":"ok","llm_configured":bool,"provider":str}`，注意 provider 在运行中切换配置后可能滞后）与 `POST /config`。改字段两头要一起改，且改完 C# 别忘了重新 build。
 - 多轮记忆：LangGraph `AsyncSqliteSaver`（SQLite 落盘 `backend/data/checkpoints.db`），`thread_id` 用玩家名隔离；重启后端历史不丢，删该文件即清空（见核心机制备忘第 7 条、踩坑 19）。
 - Harmony：dll 在 `D:\Steam\steamapps\common\Stardew Valley\smapi-internal\0Harmony.dll`，csproj 显式引用 + `Private=false`；Entry 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 安装。
 - 编译命令：在 `ModTemplate` 目录下 `dotnet build`。

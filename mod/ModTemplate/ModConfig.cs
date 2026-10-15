@@ -14,5 +14,11 @@ namespace StardewAIAssistant
 
         /// <summary>回答温度 0.0-2.0：越高越有创意但越容易胡说，推荐 0.5-0.9</summary>
         public float Temperature { get; set; } = 0.7f;
+
+        /// <summary>backend 目录的绝对路径（含 main.py 和 pyproject.toml），用于自动拉起后端</summary>
+        public string BackendDir { get; set; } = "";
+
+        /// <summary>游戏启动时是否自动拉起后端（需 BackendDir 已填）</summary>
+        public bool AutoStartBackend { get; set; } = true;
     }
 }

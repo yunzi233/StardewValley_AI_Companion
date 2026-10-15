@@ -65,6 +65,7 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 - **双入口复用同一套后端流程**：聊天框提问经 Harmony 补丁（`ChatBox.textBoxEnter(string)` 的 Prefix）截获，`"AI "` 前缀才拦截，其他消息原样放行；F7 测试问题池逻辑独立保留
 - **LLM 工厂模式**：[llm_factory.py](backend/src/aipy/llm_factory.py) 启动时读 `config.json`，按 `provider` 创建 `ChatOllama` 或 `ChatOpenAI`（四个云端厂商的 base_url 已内置预设）；嵌入模型始终用本地 fastembed 的 `bge-small-zh-v1.5`（ONNX 随后端自带），与对话模型选型、是否装 Ollama 无关
 - **游戏内配置（GMCM）**：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# 推送到后端 `POST /config` → 写 `config.json` + 重建 LLM 注入对话图，无需重启；后端未启动时配置只存本地 ModConfig.json，启动后需重新保存
+- **后端自动拉起**：GMCM 里填 `后端目录路径`（backend 文件夹绝对路径）+ 开 `自动启动后端` 后，进游戏 C# 先探活 `GET /health`，后端没起就自动用 uv 拉起并轮询等就绪（最多 30 秒），日志落 `backend/backend.log`；游戏退出时自动关闭 C# 拉起的后端进程（手动启动的不受影响）
 - `await` 之后的代码运行在线程池后台线程，所有 UI 操作（HUD / 聊天框）通过主线程任务队列（`Queue<Action>` + `UpdateTicked`）调度回游戏主线程执行，避免随机崩溃
 - 全局复用单个 `HttpClient`，15 秒超时，请求期间游戏照常运行不卡顿
 - 向量库在后端启动时只加载一次；每次请求先做向量检索（top-3），把参考资料片段和游戏状态一起注入提示词
@@ -279,6 +280,8 @@ uv run uvicorn main:app --port 8000      # 启动服务（调试可加 --reload�
 启动日志出现「向量库加载完成」和 `[LLM] provider=..., model=...` 即表示知识库与对话模型均正常载入。
 
 > 注意命令必须是 `uv run uvicorn ...`，直接写 `uv uvicorn` 会报 `unrecognized subcommand 'uvicorn'`。
+>
+> **嫌每次手动启动麻烦？** 编译好 Mod 后可以在游戏内配置自动拉起：ESC → Mod 选项 → 「后端目录路径」填 backend 文件夹的绝对路径，保持「自动启动后端」开启，之后进游戏会自动拉起 / 退出游戏自动关闭，无需手动操作。
 
 ### 5. 编译并部署 Mod
 
@@ -394,7 +397,8 @@ dotnet build
 - [ ] 气泡对话 UI：AI 回复以气泡形式从机器人贴图头上冒出（现为聊天框 / HUD 文字）
 - [ ] 主动提醒：不对话时 AI 偶尔主动提示玩家（触发机制待定，如体力低 / 节日 / 任务到期）
 - [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求
-- [ ] **面向玩家打包（当前优先级，路线 2）**：PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖（嵌入已先行切到 fastembed，见上）
+- [x] 后端生命周期打通（2026-10-15）：`GET /health` 零开销探活 + C# 启动时检测 / 自动拉起（uv，轮询最多 30 秒，日志落 `backend.log`）/ 游戏退出自动关闭自己拉起的进程；GMCM 新增「后端目录路径」「自动启动后端」
+- [ ] **面向玩家打包（当前优先级，路线 2）**：PyInstaller 打包 exe + 把"自动拉起 uv"换成"拉起打包好的 exe"，做到玩家零环境依赖（嵌入已先行切到 fastembed，见上）
 
 ## 常见问题
 
@@ -406,7 +410,9 @@ dotnet build
 | AI 回复驴唇不对马嘴 / 像串了别人的对话 | 多轮记忆按玩家名（thread_id）隔离：改了角色名 = 新会话；测试残留的旧历史会一直保留，想让 AI"失忆"就删 `backend/data/checkpoints.db` 后重启后端 |
 | `uv uvicorn` 报 `unrecognized subcommand` | 少了 `run`，正确命令是 `uv run uvicorn main:app --port 8000` |
 | 输入 `AI 问题` 被当成普通聊天发出去 | Harmony 补丁未生效：看 SMAPI 启动日志有无补丁加载记录；确认 `dotnet build` 后 Mods 目录 DLL 已更新 |
-| HUD 提示「AI大脑连接失败」 | Python 后端未启动或端口不是 8000，先启动后端 |
+| HUD 提示「AI大脑连接失败」 | Python 后端未启动或端口不是 8000。可在 GMCM 填「后端目录路径」开启自动拉起；或手动启动后端 |
+| HUD 提示「后端启动超时」 | 查看 `backend/backend.log` 定位：常见原因是端口被占（残留了旧后端进程）、目录里没有 main.py、或首次拉起时 uv 要解析依赖超过 30 秒 |
+| HUD 提示「拉起失败，找不到 uv」 | uv 未安装或不在 PATH：重开终端执行 `uv --version` 验证；游戏进程继承的 PATH 需包含 uv 所在目录 |
 | 后端日志报 Ollama 连接错误 | 仅当对话 provider=`ollama` 时才需要 Ollama：确认服务已运行（默认端口 11434）或执行 `ollama serve`。注意：嵌入已改用 fastembed，检索不再依赖 Ollama |
 | 后端启动报找不到 `chroma_db` / 集合为空 | 还没建知识库，先跑 `uv run python src/aipy/build_knowledge_base.py` |
 | 建库时下载嵌入模型超时（`Could not download model ... from any source`） | 国内访问 HuggingFace 超时；先设镜像 `$env:HF_ENDPOINT="https://hf-mirror.com"` 再重跑建库脚本 |

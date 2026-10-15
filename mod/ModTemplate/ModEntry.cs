@@ -5,6 +5,10 @@
 //   using System.Net.Http;         // HttpClient / StringContent / HttpRequestException
 //   using System.Text;             // Encoding.UTF8
 //   using System.Text.Json;        // JsonSerializer / JsonException
+//   using System.Text.Json.Serialization; // JsonPropertyName（snake_case 字段映射）
+//   using System.Threading;        // CancellationTokenSource（/health 3 秒短超时）
+//   using System.Diagnostics;      // Process（自动拉起后端进程）
+//   using System.IO;               // Path / Directory / StreamWriter（后端日志落盘）
 //   using Microsoft.Xna.Framework; // Color（聊天框消息颜色 LightSkyBlue）
 //   using HarmonyLib;              // Harmony 补丁入口（0Harmony.dll 由 SMAPI 4 自带）
 //   using StardewModdingAPI;       // Mod / IModHelper / Context
@@ -15,10 +19,14 @@
 // ============================================================
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;              // Process（自动拉起 Python 后端）
+using System.IO;                       // Path / Directory / StreamWriter（backend.log 落盘）
 using System.Linq;                     // 背包/好感度汇总用 LINQ 筛选拼接
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;  // JsonPropertyName（/health 的 snake_case 字段映射）
+using System.Threading;                // CancellationTokenSource（/health 3 秒短超时）
 using System.Threading.Tasks;
 using HarmonyLib;
 using Microsoft.Xna.Framework;
@@ -37,8 +45,14 @@ namespace StardewAIAssistant
     /// </summary>
     public class ModEntry : Mod
     {
-        /// <summary>本地 Python 后端接口地址。</summary>
-        private const string BackendUrl = "http://127.0.0.1:8000/chat";
+        /// <summary>本地 Python 后端基础地址（/chat、/health、/config 都从这里派生）。</summary>
+        private const string BackendBaseUrl = "http://127.0.0.1:8000";
+
+        /// <summary>对话接口地址（POST，现有功能）。</summary>
+        private const string BackendUrl = BackendBaseUrl + "/chat";
+
+        /// <summary>健康检查地址（GET，启动检测用；下一步"自动拉起后端 + 轮询就绪"复用）。</summary>
+        private const string HealthUrl = BackendBaseUrl + "/health";
 
         /// <summary>
         /// 全局唯一的 HttpClient（官方推荐做法：整个 Mod 生命周期复用同一个实例，
@@ -93,6 +107,15 @@ namespace StardewAIAssistant
         /// </summary>
         private Texture2D? _robotTexture;
 
+        /// <summary>
+        /// 自己拉起的后端进程（null = 本会话没拉起过，可能是后端本来就开着）。
+        /// 只 Kill 自己拉起的进程，不碰玩家手动启动的后端。
+        /// </summary>
+        private Process? _backendProcess;
+
+        /// <summary>保护 _backendProcess 的锁（启动/退出回调可能在不同线程）。</summary>
+        private readonly object _backendProcessLock = new();
+
         public override void Entry(IModHelper helper)
         {
             // 0. 保存单例，供 Harmony 静态补丁使用
@@ -138,6 +161,14 @@ namespace StardewAIAssistant
             //    并触发 SMAPI 警告 "Tried to access a mod-provided API before all mods were initialized."
             helper.Events.GameLoop.GameLaunched += OnGameLaunched;
 
+            // 3.1 订阅进程退出钩子：游戏退出时优雅关闭自己拉起的后端进程。
+            //     注意：SMAPI 4 已移除 GameLoop.Exiting 事件（用 Cecil 反射
+            //     IGameLoopEvents 确认，全事件面都没有 Exit 类事件），改用
+            //     AppDomain.ProcessExit——窗口关闭 / 游戏菜单退出等正常退出
+            //     路径都会在 CLR 关闭前触发它；处理函数须在约 2 秒内完成，
+            //     Kill 进程树是毫秒级，足够（任务管理器强杀进程时不触发，可接受）。
+            AppDomain.CurrentDomain.ProcessExit += OnProcessExiting;
+
             // 4. 订阅 RenderedWorld 事件：在世界层之上绘制浮动精灵。
             //    该事件由 SMAPI 在每帧世界绘制完成后触发，e.SpriteBatch 仍处于
             //    Begin/End 之间，可直接叠加绘制；主线程事件，无并发风险。
@@ -162,6 +193,10 @@ namespace StardewAIAssistant
             // 注意：TextInputEventArgs 是 struct，字符在公共字段 e.Character（不是属性）；
             //       e.Key 在 IME 输入时不可靠，不要依赖它。
             Game1.game1.Window.TextInput += OnWindowTextInput;
+
+            // 启动时检测后端状态，不可达则按配置自动拉起（fire-and-forget，不阻塞游戏启动）。
+            // 完整流程见 EnsureBackendReadyAsync：健康检查 → 按需拉起 → 轮询等就绪。
+            _ = EnsureBackendReadyAsync();
         }
 
         /// <summary>
@@ -264,6 +299,24 @@ namespace StardewAIAssistant
                     min: 0f,
                     max: 2f,
                     interval: 0.1f
+                );
+
+                // 后端目录：自动拉起 Python 后端用（绝对路径，含 main.py 的那个文件夹）
+                gmcm.AddTextOption(
+                    this.ModManifest,
+                    getValue: () => _config.BackendDir,
+                    setValue: v => _config.BackendDir = v,
+                    name: () => "后端目录路径",
+                    tooltip: () => "填 backend 文件夹的绝对路径（如 D:\\xxx\\backend）；留空则不自动拉起"
+                );
+
+                // 是否自动拉起后端：开启后游戏启动时若检测不到后端，会自动用 uv 运行
+                gmcm.AddBoolOption(
+                    this.ModManifest,
+                    getValue: () => _config.AutoStartBackend,
+                    setValue: v => _config.AutoStartBackend = v,
+                    name: () => "自动启动后端",
+                    tooltip: () => "游戏启动时自动运行后端；关闭则需手动启动"
                 );
 
                 Monitor.Log("已注册 GenericModConfigMenu 配置界面", LogLevel.Info);
@@ -577,6 +630,226 @@ namespace StardewAIAssistant
         internal void EnqueueChatMessageFromPatch(string text)
             => EnqueueChatMessage(text, ChatReplyColor);
 
+        // ================================================================
+        // 后端健康检查（启动时检测一次；下一步"自动拉起后端"复用为轮询）
+        // ================================================================
+
+        /// <summary>
+        /// 检测后端健康状态。返回 (后端是否可达, LLM 是否已配置)。
+        /// 超时 3 秒（比 /chat 的 15 秒短，启动检测不能卡太久）。
+        /// 任何异常都视为"后端不可达"，不向调用方抛异常。
+        /// internal 可见性：下一步"自动拉起后端 + 轮询等待就绪"会复用本方法。
+        /// </summary>
+        internal async Task<(bool ok, bool llmConfigured)> CheckBackendHealthAsync()
+        {
+            try
+            {
+                // 用 CancellationTokenSource 把超时缩短到 3 秒：
+                // 全局 HttpClient 的超时是 15 秒，实际生效的是两者中较短的那个。
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                using HttpResponseMessage response = await HttpClient.GetAsync(HealthUrl, cts.Token);
+                response.EnsureSuccessStatusCode();
+
+                string json = await response.Content.ReadAsStringAsync(cts.Token);
+                HealthResponse? result = JsonSerializer.Deserialize<HealthResponse>(json, JsonOptions);
+
+                // 拿到合法 JSON 且 status=ok 才算后端可达；LLM 配置状态原样透传
+                bool ok = string.Equals(result?.Status, "ok", StringComparison.OrdinalIgnoreCase);
+                return (ok, ok && (result?.LlmConfigured ?? false));
+            }
+            catch (Exception)
+            {
+                // 连接失败 / 3 秒超时（OperationCanceledException）/ 非 2xx / JSON 解析失败，
+                // 统一视为"后端不可达"
+                return (false, false);
+            }
+        }
+
+        /// <summary>
+        /// 启动时的后端保障流程：健康检查 → 可达则按 LLM 配置情况提示；
+        /// 不可达则按配置自动拉起后端并轮询等就绪。
+        /// 在 OnGameLaunched 里以 fire-and-forget 方式调用，不阻塞游戏启动。
+        /// HUD 显示走 _mainThreadActions 主线程队列（EnqueueHudMessage 内部处理），
+        /// 因此 await 之后的后台线程上下文里也能安全调用。
+        /// </summary>
+        private async Task EnsureBackendReadyAsync()
+        {
+            var (ok, llmConfigured) = await CheckBackendHealthAsync();
+            if (ok)
+            {
+                // 后端本来就开着（玩家手动启动 / 上次游戏退出时没杀干净），不重复拉起
+                if (!llmConfigured)
+                    EnqueueHudMessage("AI 伴侣：请在 ESC → Mod 选项里配置 AI 厂商和 Key", isError: true);
+                else
+                    Monitor.Log("[AI伴侣] 后端已就绪，LLM 已配置", LogLevel.Info);
+                return;
+            }
+
+            // ---- 后端不可达，分三种情况处理 ----
+
+            // 情况 1：玩家关掉了自动启动 → 提醒手动启动
+            if (!_config.AutoStartBackend)
+            {
+                EnqueueHudMessage("AI 伴侣：后端未启动（自动启动已关闭），请手动运行后端", isError: true);
+                return;
+            }
+
+            // 情况 2：没填后端目录 → 提醒去 GMCM 填
+            if (string.IsNullOrWhiteSpace(_config.BackendDir))
+            {
+                EnqueueHudMessage("AI 伴侣：未配置后端目录，请在 ESC → Mod 选项里填写 backend 路径", isError: true);
+                return;
+            }
+
+            // 情况 3：目录已填 → 拉起并等就绪
+            EnqueueHudMessage("AI 伴侣正在启动后端...");
+            bool started = await StartBackendAsync();
+            if (!started)
+                return; // 失败原因已在 StartBackendAsync 里用 HUD 提示过
+
+            // 就绪后复查 LLM 配置情况，给对应的上线提示
+            var (_, llmOk) = await CheckBackendHealthAsync();
+            if (!llmOk)
+                EnqueueHudMessage("AI 伴侣：后端已上线，但还没配置 AI 厂商和 Key（ESC → Mod 选项）", isError: true);
+            else
+                EnqueueHudMessage("AI 伴侣已上线！");
+        }
+
+        /// <summary>
+        /// 尝试用 uv 拉起 Python 后端并轮询 /health 等待就绪（最多 30 秒）。
+        /// 返回是否成功就绪；任何异常都转为 HUD 提示 + false，不向调用方抛。
+        /// 拉起的进程记录到 _backendProcess，游戏退出时由 OnGameExiting 负责关闭。
+        /// </summary>
+        private async Task<bool> StartBackendAsync()
+        {
+            string backendDir = _config.BackendDir.Trim().TrimEnd('\\', '/');
+
+            // 1. 校验目录存在（GMCM 里填错路径是常见操作，先拦一道）
+            if (!Directory.Exists(backendDir))
+            {
+                EnqueueHudMessage("AI 伴侣：后端目录不存在，请检查 ESC → Mod 选项里的路径", isError: true);
+                return false;
+            }
+
+            try
+            {
+                // 2. 构造启动信息：等效于在 backend 目录下执行 `uv run uvicorn main:app --port 8000`。
+                //    UseShellExecute=false 才能重定向输出；重定向后必须持续读流，
+                //    否则管道缓冲区写满后 Python 会被阻塞卡死（见下方两个 PumpStream 任务）。
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "uv",
+                    Arguments = "run uvicorn main:app --port 8000",
+                    WorkingDirectory = backendDir,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,           // 不弹黑框
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+
+                // 3. 启动进程。最常见失败：uv 没装或不在 PATH（Win32Exception）
+                Process process;
+                try
+                {
+                    process = Process.Start(psi)!;
+                }
+                catch (Exception ex)
+                {
+                    EnqueueHudMessage("AI 伴侣：拉起失败，找不到 uv，请确认已安装 uv 并加入 PATH", isError: true);
+                    Monitor.Log($"启动后端失败：{ex.Message}", LogLevel.Warn);
+                    return false;
+                }
+
+                // 4. 记录到字段（加锁）：游戏退出时 OnGameExiting 按它 Kill
+                lock (_backendProcessLock)
+                {
+                    _backendProcess = process;
+                }
+
+                // 5. 异步读 stdout/stderr 落盘到 backend.log（fire-and-forget）。
+                //    AutoFlush 保证每行立即写盘，进程被 Kill 后日志不丢；
+                //    两路读流共用一个 writer，写行时加锁；两路都结束后统一 Dispose。
+                string logPath = Path.Combine(backendDir, "backend.log");
+                var logWriter = new StreamWriter(logPath, append: false) { AutoFlush = true };
+                var logLock = new object();
+                _ = Task.WhenAll(
+                    PumpStreamAsync(process.StandardOutput, logWriter, logLock, "stdout"),
+                    PumpStreamAsync(process.StandardError, logWriter, logLock, "stderr")
+                ).ContinueWith(_ => logWriter.Dispose());
+
+                // 6. 轮询 /health：每秒一次，最多 30 次（后端要加载向量库，首次启动较慢）
+                for (int i = 0; i < 30; i++)
+                {
+                    await Task.Delay(1000);
+                    var (ok, _) = await CheckBackendHealthAsync();
+                    if (ok)
+                        return true;
+
+                    // 进程提前退出（如端口被占、目录里没有 main.py）→ 不必等满 30 秒
+                    if (process.HasExited)
+                        break;
+                }
+
+                EnqueueHudMessage("AI 伴侣：后端启动超时，请查看 backend 目录下的 backend.log", isError: true);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                // 兜底：目录校验通过后仍可能出错（如磁盘 IO、权限问题）
+                EnqueueHudMessage("AI 伴侣：后端启动失败，详情见 SMAPI 日志", isError: true);
+                Monitor.Log($"启动后端异常：{ex}", LogLevel.Warn);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 后台泵：持续读取进程的一条输出流并写入 backend.log。
+        /// 若不读流，重定向的管道缓冲区写满后 Python 端 print 会阻塞（后端假死）。
+        /// 进程被 Kill 时流会关闭，ReadLineAsync 返回 null 或抛异常，均按流结束处理。
+        /// </summary>
+        private static async Task PumpStreamAsync(StreamReader reader, StreamWriter logWriter, object logLock, string tag)
+        {
+            try
+            {
+                string? line;
+                while ((line = await reader.ReadLineAsync()) != null)
+                {
+                    lock (logLock)
+                        logWriter.WriteLine($"[{tag}] {line}");
+                }
+            }
+            catch
+            {
+                // 流被强制关闭（Kill 进程）时的 IO 异常，忽略
+            }
+        }
+
+        /// <summary>
+        /// 进程退出钩子（AppDomain.ProcessExit）：关闭自己拉起的后端进程，
+        /// entireProcessTree 连 uv 派生的 python 子进程一起杀。
+        /// 只处理 _backendProcess 里记录的进程，玩家手动启动的后端不受影响。
+        /// 注意：本方法在 CLR 关闭阶段执行，有约 2 秒时限，不做任何慢操作。
+        /// </summary>
+        private void OnProcessExiting(object? sender, EventArgs e)
+        {
+            lock (_backendProcessLock)
+            {
+                if (_backendProcess is { HasExited: false } p)
+                {
+                    try
+                    {
+                        p.Kill(entireProcessTree: true);
+                        Monitor.Log("已关闭自动拉起的后端进程", LogLevel.Info);
+                    }
+                    catch (Exception ex)
+                    {
+                        Monitor.Log($"关闭后端进程失败：{ex.Message}", LogLevel.Warn);
+                    }
+                }
+                _backendProcess = null;
+            }
+        }
+
         /// <summary>
         /// 把 GMCM 里的配置推送到 Python 后端（POST /config）。
         /// GMCM 的 save 回调是同步 Action，所以这里 fire-and-forget：
@@ -598,8 +871,8 @@ namespace StardewAIAssistant
                 string json = JsonSerializer.Serialize(payload);
                 using var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-                // 复用全局 HttpClient（15s 超时），地址硬编码为后端 /config
-                var response = await HttpClient.PostAsync("http://127.0.0.1:8000/config", content);
+                // 复用全局 HttpClient（15s 超时），地址从 BackendBaseUrl 派生
+                var response = await HttpClient.PostAsync(BackendBaseUrl + "/config", content);
                 response.EnsureSuccessStatusCode();
 
                 Game1.addHUDMessage(new HUDMessage("AI伴侣：配置已推送到后端"));
@@ -666,6 +939,19 @@ namespace StardewAIAssistant
 
             /// <summary>当前未完成任务的标题与目标，没有则空字符串。</summary>
             public string CurrentQuest { get; set; } = string.Empty;
+        }
+
+        /// <summary>
+        /// /health 接口返回结构：{"status":"ok","llm_configured":true,"provider":"deepseek"}。
+        /// </summary>
+        private sealed class HealthResponse
+        {
+            public string Status { get; set; } = string.Empty;
+
+            // 后端字段是 snake_case："大小写不敏感"选项不会忽略下划线，
+            // llm_configured 映射不到 LlmConfigured，必须显式指定 JSON 字段名。
+            [JsonPropertyName("llm_configured")]
+            public bool LlmConfigured { get; set; }
         }
 
         /// <summary>

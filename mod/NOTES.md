@@ -124,6 +124,14 @@
     - 解决：GameLaunched 里 `Game1.game1.Window.TextInput += OnWindowTextInput;`，回调读 `e.Character`；`\r \n \b \t` 等控制字符用 `char.IsControl` 过滤，Enter/Esc/Backspace 走 SMAPI ButtonPressed 分支（双保险）。
     - 字符链路：SDL_TEXTINPUT → `Sdl.Keyboard.TextInputEvent` → `GameWindow.TextInput`（DesktopGL 版，反射见到 Sdl+Keyboard+TextInputEvent 佐证）。
 
+24. **项目文件夹改名后，Python 虚拟环境里的脚本蹦床（trampoline）失效**
+    - 现象：`AIpy/` → `backend/`（根目录 `AI_Projects` → `StardewValley_AI_Companion`）后，`uv run uvicorn main:app --port 8000` 报 `error: uv trampoline failed to canonicalize script path`（此前已输出 `Built aipy @ file:///…` 并重装 1 个包）。
+    - 原因：uv 在 Windows 上把控制台脚本入口编译成 `.exe` 蹦床，**内部写死了 venv 的绝对路径**。建 venv 时是 `D:\AI_Projects\AIpy\.venv`，改名后变成 `D:\StardewValley_AI_Companion\backend\.venv`，旧蹦床解引用失败。依赖清单（`pyproject.toml` / `uv.lock`）未变，**不是依赖坏了**；uv 只因可编辑包 `aipy` 的路径变化自动重建了 `aipy.exe`，不会顺带刷新 `uvicorn.exe`。
+    - 解决：在 `backend/` 下执行 `uv sync --reinstall-package uvicorn`，强制重装该包并用新路径重生成蹦床；其它控制台脚本若报同样错，同一命令换个包名即可。
+    - 佐证：修复前 `.venv\Scripts\uvicorn.exe` 时间戳停留在建 venv 当天（2026-10-4），修复后刷新为当日，`uvicorn --version` 恢复输出。
+    - 附带：`pyvenv.cfg` 里 `prompt = AIpy` 是旧名残留，**只影响手动 `activate` 的提示符**，无害。
+    - 对比：数据库路径不受影响——`config.py` 用 `Path(__file__).resolve().parents[2]` 相对推导 `PROJECT_ROOT`，`chroma_db/`、`data/checkpoints.db` 随目录搬家自动跟随，无需重建。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -340,6 +348,10 @@
 - [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键（已调研：GMCM 有 `AddKeybind`/`AddKeybindList` API，见 libs 接口文件 L103/L112，ModConfig 字段用 `KeybindList` 类型即可，SMAPI 原生支持序列化）。
 - [ ] emotion 现在固定 happy 只打日志（失败时返回 error），后面接表情/立绘显示。
 - [ ] main.py L12 有一行未使用的 `from langchain.chat_models import init_chat_model`，下次改动时顺手清理。
+- [ ] 气泡对话 UI：AI 回复以气泡形式从机器人贴图头上冒出（现为聊天框 / HUD 文字）。
+- [ ] 主动提醒：不对话时 AI 偶尔主动提示玩家（触发机制待定，如体力低 / 节日 / 任务到期）。
+- [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求。
+- [ ] 面向玩家打包（当前优先级，路线 2）：fastembed 替换 Ollama 嵌入 + PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖。
 
 ## 五、环境备忘
 

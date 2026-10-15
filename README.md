@@ -393,6 +393,10 @@ dotnet build
 - [x] 多轮对话记忆：LangGraph 对话图 + AsyncSqliteSaver（SQLite 落盘 `backend/data/checkpoints.db`），按玩家名隔离历史，重启后端不丢
 - [ ] F7 / `AI ` 前缀改为可配置，避免与其他 Mod 冲突
 - [ ] `emotion` 字段驱动机器人表情 / 立绘变化
+- [ ] 气泡对话 UI：AI 回复以气泡形式从机器人贴图头上冒出（现为聊天框 / HUD 文字）
+- [ ] 主动提醒：不对话时 AI 偶尔主动提示玩家（触发机制待定，如体力低 / 节日 / 任务到期）
+- [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求
+- [ ] **面向玩家打包（当前优先级，路线 2）**：fastembed 替换 Ollama 嵌入 + PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖
 
 ## 常见问题
 

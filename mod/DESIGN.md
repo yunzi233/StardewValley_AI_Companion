@@ -97,3 +97,6 @@ C# 收到 {reply, emotion}
 - [ ] 主动提醒
 - [x] 游戏内配置界面（GMCM，2026-10-14）：C# 端 `ModConfig.cs` + `RegisterGmcmConfig`（GameLaunched 事件），Python 端 `POST /config` + `save_config` + `PlaceholderLLM`；配置改完无需重启后端，对话历史保留。
 - [ ] 设置玩家配置界面
+- [ ] 气泡对话 UI：AI 回复以气泡形式从机器人贴图头上冒出（现为聊天框 / HUD 文字）
+- [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求
+- [ ] **面向玩家打包（当前优先级，路线 2）**：fastembed 替换 Ollama 嵌入 + PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖

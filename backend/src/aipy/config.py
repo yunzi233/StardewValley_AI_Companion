@@ -13,9 +13,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 COLLECTION_NAME = "stardew_wiki"
 
-# ---- 嵌入模型（本地 Ollama，知识库向量化固定走本地，与对话模型选型无关）----
-EMBEDDING_MODEL = "bge-m3"
-OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+# ---- 嵌入模型（fastembed 本地 ONNX，无需 Ollama 服务；与对话模型选型无关）----
+# 换模型 = 换向量维度，必须重建 chroma_db（见 NOTES 踩坑 12）
+EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 
 # ---- 检索参数 ----
 TOP_K = 3

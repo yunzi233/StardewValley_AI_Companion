@@ -1,6 +1,6 @@
 # 星露谷 AI 陪玩 Mod（Stardew AI Companion）
 
-一个由 **SMAPI Mod（C#）+ 本地 Python AI 后端（FastAPI + LangChain + LangGraph）** 组成的星露谷物语 AI 陪伴系统，**支持 RAG 知识库检索**（ChromaDB + bge-m3）与**多轮对话记忆**，对话模型**本地 Ollama / 云端 API（DeepSeek、智谱、通义、Kimi）可一键切换**。
+一个由 **SMAPI Mod（C#）+ 本地 Python AI 后端（FastAPI + LangChain + LangGraph）** 组成的星露谷物语 AI 陪伴系统，**支持 RAG 知识库检索**（ChromaDB + bge-small-zh-v1.5 本地 ONNX 嵌入）与**多轮对话记忆**，对话模型**本地 Ollama / 云端 API（DeepSeek、智谱、通义、Kimi）可一键切换**。
 
 三种对话方式：
 
@@ -18,7 +18,8 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 **✅ 已完成：**
 - 端到端通信（C# ↔ Python，HTTP + JSON）
 - 游戏内自由提问：**F7 中文输入框**（IME 正常上屏，按键全接管）或原版聊天框输入 `AI 问题`（Harmony 拦截提交），回复都进聊天框
-- RAG 知识库（ChromaDB + bge-m3 嵌入，已收录作物 / 鱼类 / NPC 礼物）
+- RAG 知识库（ChromaDB + fastembed `bge-small-zh-v1.5` 本地嵌入，已收录作物 / 鱼类 / NPC 礼物）
+- 嵌入改本地 ONNX（2026-10-15）：`OllamaEmbeddings`(bge-m3, 1024 维) → `FastEmbedEmbeddings`(`BAAI/bge-small-zh-v1.5`, 512 维，int8 ~23MB)，检索不再依赖 Ollama
 - 游戏状态感知：名字 / 体力 / 血量 / 游戏时间 / 日期（1-28）/ 季节 / 是否下雨 / 地点 / 金币 / 手持工具 / 耕种 & 采矿等级 / 存档已玩天数 / 背包 / NPC 好感度 / 当日任务
 - LLM 配置化（BYOK 基础）：`config.json` 切换 provider——本地 `ollama`（免 Key）或云端 `deepseek` / `zhipu` / `qwen` / `kimi`（OpenAI 兼容接口，自带 Key）
 - 多轮对话记忆（LangGraph + SQLite 持久化）：AI 记得本次会话聊过的内容，按玩家名隔离历史，**重启后端也不丢**；上下文窗口只带最近 10 轮（完整历史仍存 SQLite，不丢数据）
@@ -42,7 +43,7 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
                          [LangGraph 对话图: retrieve -> chat]
                                       |
                                       v
-                    [ChromaDB 检索 (bge-m3, top-3)]
+                    [ChromaDB 检索 (bge-small-zh-v1.5, top-3)]
                                       |
                                       v 参考资料 + 历史消息
                               [LangChain 拼提示词]
@@ -62,7 +63,7 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 
 **关键设计**：
 - **双入口复用同一套后端流程**：聊天框提问经 Harmony 补丁（`ChatBox.textBoxEnter(string)` 的 Prefix）截获，`"AI "` 前缀才拦截，其他消息原样放行；F7 测试问题池逻辑独立保留
-- **LLM 工厂模式**：[llm_factory.py](backend/src/aipy/llm_factory.py) 启动时读 `config.json`，按 `provider` 创建 `ChatOllama` 或 `ChatOpenAI`（四个云端厂商的 base_url 已内置预设）；嵌入模型始终用本地 Ollama 的 bge-m3，与对话模型选型无关
+- **LLM 工厂模式**：[llm_factory.py](backend/src/aipy/llm_factory.py) 启动时读 `config.json`，按 `provider` 创建 `ChatOllama` 或 `ChatOpenAI`（四个云端厂商的 base_url 已内置预设）；嵌入模型始终用本地 fastembed 的 `bge-small-zh-v1.5`（ONNX 随后端自带），与对话模型选型、是否装 Ollama 无关
 - **游戏内配置（GMCM）**：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# 推送到后端 `POST /config` → 写 `config.json` + 重建 LLM 注入对话图，无需重启；后端未启动时配置只存本地 ModConfig.json，启动后需重新保存
 - `await` 之后的代码运行在线程池后台线程，所有 UI 操作（HUD / 聊天框）通过主线程任务队列（`Queue<Action>` + `UpdateTicked`）调度回游戏主线程执行，避免随机崩溃
 - 全局复用单个 `HttpClient`，15 秒超时，请求期间游戏照常运行不卡顿
@@ -89,6 +90,7 @@ AI_Projects/
 │   │   │   └── graph.py       # retrieve → chat 两节点 + AsyncSqliteSaver 记忆持久化
 │   │   ├── llm_factory.py     # LLM 工厂：读/写 config.json 创建本地/云端对话模型
 │   │   ├── config.json        # 【自行创建，不入库】真实配置（含 API Key）
+│   │   ├── embeddings.py      # 本地嵌入封装：fastembed（ONNX）实现 LangChain Embeddings
 │   │   └── build_knowledge_base.py  # 建库脚本：wiki_data → chroma_db
 │   ├── data/                  # 对话历史 SQLite（checkpoints.db，本地生成，已 gitignore）
 │   └── chroma_db/             # 向量库（脚本本地生成，已 gitignore）
@@ -122,7 +124,7 @@ AI_Projects/
 - LLM 编排：LangChain（`langchain-ollama` / `langchain-openai` / `langchain-chroma` / `langchain-text-splitters`）+ LangGraph（对话图 + AsyncSqliteSaver 多轮记忆持久化）
 - LLM 供应方（config.json 切换）：本地 Ollama，或云端 OpenAI 兼容接口（DeepSeek / 智谱 GLM / 通义千问 / Kimi）
 - 向量库：ChromaDB（本地持久化，无需起数据库服务）
-- 嵌入模型：本地 Ollama `bge-m3`（知识库向量化，不随对话 provider 改变）
+- 嵌入模型：fastembed `BAAI/bge-small-zh-v1.5`（ONNX int8，随后端自带，中文 512 维；知识库向量化不随对话 provider 改变，也不需要本地 Ollama）
 
 ## 环境要求
 
@@ -133,17 +135,13 @@ AI_Projects/
 | .NET SDK | 6.0（编译 Mod） |
 | Python | ≥ 3.11，使用 [uv](https://docs.astral.sh/uv/) 管理依赖 |
 | 对话模型（二选一） | **本地模式**：[Ollama](https://ollama.com/)（默认端口 11434）+ `qwen2.5:3b`；**云端模式**：DeepSeek / 智谱 / 通义 / Kimi 任一厂商的 API Key |
-| 嵌入模型（必需本地） | Ollama 的 `bge-m3`——无论对话用本地还是云端，知识库向量化都走本地 Ollama，必须 `ollama pull bge-m3` |
+| 嵌入模型 | 无需额外安装——`fastembed` 的 `BAAI/bge-small-zh-v1.5`（ONNX int8，~23MB）随 Python 依赖自带，首次建库自动下载并缓存，之后离线可用 |
 
 ### 首次运行前置准备
 
 1. **Python 环境**：装 Python 3.11+ 和 [uv](https://docs.astral.sh/uv/)
 2. **游戏 Mod 环境**：装 SMAPI 4.x + [GenericModConfigMenu](https://www.nexusmods.com/stardewvalley/mods/5098)
-3. **通用嵌入服务**：装 [Ollama](https://ollama.com)，拉取嵌入模型
-   ```bash
-   ollama pull bge-m3
-   ```
-   （嵌入模型固定走本地 Ollama，与对话模型的选型无关）
+3. **嵌入模型**：无需手动安装——建库时 `fastembed` 会自动下载 `BAAI/bge-small-zh-v1.5`（ONNX int8，~23MB）并缓存到本地，之后完全离线可用（国内网络下载超时则先设镜像 `$env:HF_ENDPOINT="https://hf-mirror.com"`）
 4. **GMCM 前置 dll**：把 `GenericModConfigMenu.dll` 复制到 `mod/ModTemplate/libs/`（详见下文"编译并部署 Mod"）
 5. **构建知识库**：
    ```bash
@@ -187,16 +185,15 @@ AI_Projects/
 
 ## 快速开始
 
-### 1. 准备本地 Ollama
+### 1. 准备对话模型
 
-安装 [Ollama](https://ollama.com/download)。**嵌入模型 `bge-m3` 无论用哪种对话模式都必须拉取**（知识库向量化固定走本地）；对话模型仅在"本地模式"下需要：
+安装 [Ollama](https://ollama.com/download)（仅本地对话模式需要；**嵌入模型无需准备**——fastembed 的 `BAAI/bge-small-zh-v1.5` 随 Python 依赖自带，建库时自动下载）；对话模型仅在"本地模式"下需要：
 
 ```bash
-ollama pull bge-m3       # 嵌入模型（必做，知识库向量化用）
-ollama pull 本地模型   # 对话模型（仅本地模式需要）
+ollama pull 本地模型   # 对话模型（仅本地模式需要，如 qwen2.5:3b）
 ```
 
-Ollama 安装后一般会自动在后台运行（默认端口 `11434`）；若没有，手动执行 `ollama serve`。
+Ollama 安装后一般会自动在后台运行（默认端口 `11434`）；若没有，手动执行 `ollama serve`。用云端 provider 时完全不需要 Ollama。
 
 ### 2. 准备知识库（首次必做）
 
@@ -214,11 +211,12 @@ uv sync                                                      # 首次安装依�
 uv run python src/aipy/build_knowledge_base.py
 ```
 
-脚本会：读取 `wiki_data/*.md` → 按 `##` 切块（保留标题）→ bge-m3 向量化 → 写入 `chroma_db/`，末尾还会跑一条自测查询打印命中块。
+脚本会：读取 `wiki_data/*.md` → 按 `##` 切块（保留标题）→ fastembed `bge-small-zh-v1.5` 向量化 → 写入 `chroma_db/`，末尾还会跑一条自测查询打印命中块。
 
 > 注意：
 > - 脚本采用**全量重建**（先删除旧 `chroma_db/` 再写入），修改 wiki 后重跑即可，不会产生重复数据
-> - 首次向量化较慢（bge-m3 要逐个 chunk 编码），属正常现象
+> - 首次运行会先下载嵌入模型（~23MB，缓存到系统临时目录 `fastembed_cache`），之后离线秒级完成
+> - 重建前先停掉正在运行的后端（旧 `chroma_db/` 文件被占用会报 `PermissionError [WinError 32]`）
 > - `chroma_db/` 是本地生成物，**不随仓库分发**（已加入 `.gitignore`），换机器或重新克隆后必须重新建库，否则后端启动/检索会报错
 
 ### 3. 配置对话模型
@@ -396,7 +394,7 @@ dotnet build
 - [ ] 气泡对话 UI：AI 回复以气泡形式从机器人贴图头上冒出（现为聊天框 / HUD 文字）
 - [ ] 主动提醒：不对话时 AI 偶尔主动提示玩家（触发机制待定，如体力低 / 节日 / 任务到期）
 - [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求
-- [ ] **面向玩家打包（当前优先级，路线 2）**：fastembed 替换 Ollama 嵌入 + PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖
+- [ ] **面向玩家打包（当前优先级，路线 2）**：PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖（嵌入已先行切到 fastembed，见上）
 
 ## 常见问题
 
@@ -409,9 +407,9 @@ dotnet build
 | `uv uvicorn` 报 `unrecognized subcommand` | 少了 `run`，正确命令是 `uv run uvicorn main:app --port 8000` |
 | 输入 `AI 问题` 被当成普通聊天发出去 | Harmony 补丁未生效：看 SMAPI 启动日志有无补丁加载记录；确认 `dotnet build` 后 Mods 目录 DLL 已更新 |
 | HUD 提示「AI大脑连接失败」 | Python 后端未启动或端口不是 8000，先启动后端 |
-| 后端日志报 Ollama 连接错误 | Ollama 服务未运行（默认端口 11434），执行 `ollama serve`。注意：用云端对话模型时也仍需 Ollama 提供 bge-m3 嵌入 |
+| 后端日志报 Ollama 连接错误 | 仅当对话 provider=`ollama` 时才需要 Ollama：确认服务已运行（默认端口 11434）或执行 `ollama serve`。注意：嵌入已改用 fastembed，检索不再依赖 Ollama |
 | 后端启动报找不到 `chroma_db` / 集合为空 | 还没建知识库，先跑 `uv run python src/aipy/build_knowledge_base.py` |
-| 建库时报 `model "bge-m3" not found` | 嵌入模型没拉取，执行 `ollama pull bge-m3` |
+| 建库时下载嵌入模型超时（`Could not download model ... from any source`） | 国内访问 HuggingFace 超时；先设镜像 `$env:HF_ENDPOINT="https://hf-mirror.com"` 再重跑建库脚本 |
 | 检索结果答非所问 | 检查 wiki 对应 chunk 是否自包含、是否含玩家提问的关键词；向量检索不懂逻辑条件，靠 LLM 二次筛选，详见 [NOTES.md](mod/NOTES.md) |
 | 本地模型首次回复很慢 | 首次调用需把对话/嵌入模型加载进内存/显存，属正常现象；可先 `ollama run qwen2.5:3b` 预热，嫌慢可切换云端 provider |
 | 改了 C# 代码游戏里没生效 | 忘记 `dotnet build`，游戏跑的还是 Mods 目录里的旧 DLL |
@@ -441,5 +439,5 @@ dotnet build
   并对原始描述进行了格式重写。原始版权归 Wiki 贡献者所有。
 - **SMAPI**：由 [Pathoschild](https://github.com/Pathoschild/SMAPI) 开发
 - **GenericModConfigMenu**：由 [spacechase0](https://github.com/spacechase0/StardewValleyMods) 开发
-- **bge-m3 嵌入模型**：由 BAAI 发布，MIT 协议
+- **bge-small-zh-v1.5 嵌入模型**：由 BAAI 发布，MIT 协议；本地推理由 [fastembed](https://github.com/qdrant/fastembed)（ONNX Runtime）提供
 - **LangChain / LangGraph / FastAPI / ChromaDB**：各自官方团队开发，MIT 协议

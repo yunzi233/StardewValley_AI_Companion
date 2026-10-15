@@ -28,7 +28,7 @@
 - 数据来源：stardewvalleywiki.com（MediaWiki API）
 - 抓取策略：**不做"总结"**——数字/价格/掉落率原样保留，只让 AI 清洗废话段落
 - 首批主题：四季作物 / 鱼类图鉴 / NPC 礼物 / 祭献包 / 矿洞掉落
-- 存储：ChromaDB + bge-m3（本地向量模型）
+- 存储：ChromaDB + fastembed `BAAI/bge-small-zh-v1.5`（本地 ONNX 嵌入，中文 512 维）
 - 查询：检索 top-K 相关片段 → 塞给 LLM → LLM 基于片段回答
 
 ### 5. 输入体验（✅ 已实现：借原版聊天框，绕开自研输入框）
@@ -55,7 +55,7 @@ C# Mod 收集游戏状态（10 个字段，JSON）
 FastAPI 后端
 ↓
 LangGraph 对话图（agent/graph.py，AsyncSqliteSaver 按 thread_id=玩家名 存对话历史到 data/checkpoints.db）：
-├─ retrieve 节点：ChromaDB + bge-m3 检索（top-3 片段），失败走条件边短路结束
+├─ retrieve 节点：ChromaDB + fastembed `bge-small-zh-v1.5` 检索（top-3 片段），失败走条件边短路结束
 └─ chat 节点：历史消息 + 参考资料 + 结构化游戏状态 + 问题 拼提示词，调 LLM
     ├─ 本地：Ollama（qwen2.5:3b，免 Key）
     └─ 云端：DeepSeek / 智谱 / 通义 / Kimi（OpenAI 兼容，BYOK）
@@ -71,7 +71,7 @@ C# 收到 {reply, emotion}
 
 - **local（本地模式）**：`provider: "ollama"`，免 Key；玩家自己装 Ollama + 拉 `qwen2.5:3b`；`base_url` 可改（默认本机 11434）
 - **cloud（云端模式）**：`provider` 选 `deepseek` / `zhipu` / `qwen` / `kimi`，填自己的 `api_key` 和 `model`；四家 base_url 已在工厂里预设，全部走 OpenAI 兼容接口
-- 注意：无论哪种对话模式，**嵌入模型 bge-m3 始终走本地 Ollama**，所以 Ollama 仍是必装项
+- 注意：嵌入模型已改为 fastembed `BAAI/bge-small-zh-v1.5`（ONNX，随后端自带），**Ollama 只在"本地对话模式"下才需要**
 - config.json 含密钥，已 gitignore；启动时读取一次，游戏内 GMCM 保存可热更新（走 POST /config，无需重启）
 
 待完善：
@@ -84,7 +84,7 @@ C# 收到 {reply, emotion}
 
 - [x] 端到端通信（C# ↔ Python）
 - [x] 接入本地 Ollama（qwen2.5:3b）
-- [x] RAG 知识库（ChromaDB + bge-m3，已收录作物 / 鱼类 / NPC 礼物）
+- [x] RAG 知识库（ChromaDB + fastembed `bge-small-zh-v1.5`，已收录作物 / 鱼类 / NPC 礼物；2026-10-15 由 bge-m3 切换而来）
 - [x] 状态感知（基础字段：名字 / 体力 / 时间 / 地点）
 - [x] 扩展状态感知（第一批：季节 / 是否下雨 / 日期 / 金币 / 血量，C# 收集 + Python 提示词注入）
 - [x] 扩展状态感知（第二批 a，2026-10-14）：当前工具 / 耕种 / 采矿等级 / 存档天数（C# 收集 → Python 状态块，工具名英文→中文映射，空手不显示）
@@ -99,4 +99,5 @@ C# 收到 {reply, emotion}
 - [ ] 设置玩家配置界面
 - [ ] 气泡对话 UI：AI 回复以气泡形式从机器人贴图头上冒出（现为聊天框 / HUD 文字）
 - [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求
-- [ ] **面向玩家打包（当前优先级，路线 2）**：fastembed 替换 Ollama 嵌入 + PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖
+- [x] 嵌入改本地 ONNX（2026-10-15）：bge-m3(Ollama, 1024 维) → fastembed `bge-small-zh-v1.5`(512 维, int8 ~23MB)，`chroma_db/` 全量重建，Ollama 不再是嵌入必装项
+- [ ] **面向玩家打包（当前优先级，路线 2）**：PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖

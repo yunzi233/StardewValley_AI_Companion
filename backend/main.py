@@ -7,8 +7,8 @@ from pydantic import BaseModel
 
 from langchain_chroma import Chroma
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langchain_ollama import OllamaEmbeddings
-from aipy.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, OLLAMA_BASE_URL, TOP_K
+from aipy.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, TOP_K
+from aipy.embeddings import FastEmbedEmbeddings
 from aipy.llm_factory import load_config, create_llm, save_config
 from aipy.agent.graph import init_agent, build_graph
 
@@ -99,7 +99,7 @@ class PlaceholderLLM:
 
 # ========== 启动时加载向量库（只做一次）==========
 print("正在加载向量库...")
-embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+embeddings = FastEmbedEmbeddings(model_name=EMBEDDING_MODEL)
 vectorstore = Chroma(
     persist_directory=str(CHROMA_DIR),
     embedding_function=embeddings,
@@ -175,7 +175,7 @@ async def chat_endpoint(req: ChatRequest):
     # 按图里记录的错误类型给不同提示
     if result.get("error") == "retrieval_failed":
         return ChatResponse(
-            reply="AI 暂时不可用：知识库检索服务（Ollama）可能没启动，请检查后重试。",
+            reply="AI 暂时不可用：知识库检索失败，请检查后端日志。",
             emotion="error",
         )
     if result.get("error") == "llm_failed":

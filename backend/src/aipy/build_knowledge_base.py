@@ -2,12 +2,12 @@
 import shutil
 
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 
 # 路径、模型名、集合名都从 aipy.config 统一读取，
 # 与 main.py 共享同一份配置，改一处两边同时生效。
-from aipy.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, OLLAMA_BASE_URL, WIKI_DATA_DIR
+from aipy.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL, WIKI_DATA_DIR
+from aipy.embeddings import FastEmbedEmbeddings
 
 
 def main():
@@ -31,8 +31,8 @@ def main():
     # 2. 向量化 + 存库（先删旧库，避免重复追加）
     if CHROMA_DIR.exists():
         shutil.rmtree(CHROMA_DIR)
-    print("\n正在向量化（用 bge-m3，第一次会比较慢）...")
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+    print(f"\n正在向量化（用 {EMBEDDING_MODEL}，第一次会下载模型，稍慢）...")
+    embeddings = FastEmbedEmbeddings(model_name=EMBEDDING_MODEL)
     vectorstore = Chroma.from_documents(
         documents=all_docs,
         embedding=embeddings,

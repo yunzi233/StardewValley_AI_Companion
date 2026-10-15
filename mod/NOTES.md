@@ -61,7 +61,7 @@
 12. **建库和查询用的嵌入模型必须是同一个**
     - 现象：换了嵌入模型后检索结果明显变差/维度报错。
     - 原因：chunk 向量是用建库时的模型编码的，查询时换模型，两个向量不在同一个语义空间，相似度没有意义。
-    - 解决：`build_knowledge_base.py` 和 `main.py` 里写死同一个 `OllamaEmbeddings(model="bge-m3")`；换模型 = 重新全量建库，没有捷径。
+    - 解决：嵌入统一走 `aipy/embeddings.py` 的 `FastEmbedEmbeddings`，模型名从 `aipy/config.py` 的 `EMBEDDING_MODEL` 读，建库脚本与 main.py 共用同一处配置；换模型 = 换维度（bge-m3 是 1024，bge-small-zh-v1.5 是 512）= 必须重新全量建库，没有捷径。
 
 13. **向量库只在启动时加载一次，别放进请求流程**
     - 现象/教训：Chroma 持久化目录的加载（含 collection 初始化）有开销，写在 `/chat` 请求里会让每次对话都白等。
@@ -131,6 +131,13 @@
     - 佐证：修复前 `.venv\Scripts\uvicorn.exe` 时间戳停留在建 venv 当天（2026-10-4），修复后刷新为当日，`uvicorn --version` 恢复输出。
     - 附带：`pyvenv.cfg` 里 `prompt = AIpy` 是旧名残留，**只影响手动 `activate` 的提示符**，无害。
     - 对比：数据库路径不受影响——`config.py` 用 `Path(__file__).resolve().parents[2]` 相对推导 `PROJECT_ROOT`，`chroma_db/`、`data/checkpoints.db` 随目录搬家自动跟随，无需重建。
+
+25. **fastembed 首次下载模型：国内直连 HuggingFace 会超时，且缓存落在系统临时目录**
+    - 现象：`FastEmbedEmbeddings("BAAI/bge-small-zh-v1.5")` 首次构造时连报 `Could not download model from HuggingFace: timed out`，重试 3 次后 `ValueError: Could not load model ... from any source`。
+    - 原因：fastembed 底层用 `huggingface_hub` 拉 ONNX 模型，默认端点 `huggingface.co` 在国内不稳定；它自带的备用源（GCS）同样连不上。
+    - 解决：先设镜像再跑——PowerShell `$env:HF_ENDPOINT="https://hf-mirror.com"`（`huggingface_hub` 自动识别该环境变量），再执行建库脚本；模型 ~23MB，约 20 秒拉完。
+    - 附带：默认缓存目录是 `tempfile.gettempdir()/fastembed_cache`（即系统临时目录），**可能被清理工具清掉**，之后首次检索会重新下载。后续打包（路线 2）宜把缓存固定到后端目录，避免玩家侧反复下载。
+    - 附带：重建向量库前必须先停掉运行中的后端——旧 `chroma_db/*.bin` 被占用时 `shutil.rmtree` 直接报 `PermissionError [WinError 32]`。
 
 ## 二、核心机制备忘
 
@@ -263,7 +270,7 @@
 | `SYSTEM_PROMPT` | L16-38 | 角色设定 + 铁律：游戏知识只准依据参考资料 / 资料没有就承认不知道 / 非游戏话题拒答，附正反示例 |
 | `ChatRequest` / `ChatResponse` / `ConfigRequest` | L40-51 / L54-56 / L59-62 | 请求 10 个字段：基础 5 个（PlayerName/Stamina/GameTime/Location/Message）+ 扩展 5 个（Season/IsRaining/DayOfMonth/Money/Health）；ConfigRequest 供 GMCM 推送 |
 | `PlaceholderLLM` | L65-73 | 未配置时占位，ainvoke 返回固定提示 |
-| 向量库初始化 | L75-84 | 模块级只跑一次：从 `aipy.config` 读常量 → `OllamaEmbeddings` + `Chroma` → `retriever`（k=`TOP_K`） |
+| 向量库初始化 | L75-84 | 模块级只跑一次：从 `aipy.config` 读常量 → `FastEmbedEmbeddings`（aipy/embeddings.py）+ `Chroma` → `retriever`（k=`TOP_K`） |
 | lifespan | L21-25 | async 上下文里 `build_graph()`——AsyncSqliteSaver 3.x 构造时要 running loop（见踩坑 21）；顶层 `graph = None` |
 | LLM 创建 | L104-110 | try-except：`load_config()` → `create_llm()` 工厂创建，失败用 PlaceholderLLM 占位 |
 | 依赖注入 | L115 | `init_agent()` 注入 llm/retriever/system_prompt（graph 已在 lifespan 构建好） |
@@ -307,20 +314,31 @@
 | `PROJECT_ROOT` | L10 | `Path(__file__).resolve().parents[2]` → `backend/` 根目录 |
 | `CHROMA_DIR` | L13 | `PROJECT_ROOT / "chroma_db"`，向量库持久化目录 |
 | `COLLECTION_NAME` | L14 | `"stardew_wiki"`，Chroma 集合名（main.py 和建库脚本必须一致） |
-| `EMBEDDING_MODEL` / `OLLAMA_BASE_URL` | L17-18 | `"bge-m3"` / `http://127.0.0.1:11434`，嵌入模型固定走本地 Ollama |
+| `EMBEDDING_MODEL` | L18 | `"BAAI/bge-small-zh-v1.5"`，fastembed 本地 ONNX 嵌入模型名；换模型=换维度必须重建库（原 `OLLAMA_BASE_URL` 已随 Ollama 嵌入一并移除） |
 | `TOP_K` | L21 | `3`，检索召回块数 |
 | `WIKI_DATA_DIR` | L24 | `PROJECT_ROOT / "wiki_data"`，知识库源 Markdown 目录 |
 | `CHECKPOINT_DB` | L28 | `PROJECT_ROOT / "data" / "checkpoints.db"`，对话历史 SQLite 文件（AsyncSqliteSaver 落盘用，已 gitignore） |
+
+### Python 端：`backend/src/aipy/embeddings.py`（本地嵌入封装，新增）
+
+用 fastembed（ONNX Runtime）替代 Ollama 嵌入，让检索不再依赖 Ollama 服务（路线 2 零环境依赖的前提）。自写封装而非引 `langchain-community`：只需 `Embeddings` 两个方法，避免为小功能拖进庞大依赖。
+
+| 块 | 位置 | 作用 |
+|---|---|---|
+| `FastEmbedEmbeddings` | L15-27 | 继承 `langchain_core.embeddings.Embeddings`，构造即加载 `fastembed.TextEmbedding`（首次自动下载 ONNX 模型） |
+| `embed_documents` | L21-23 | 建库/索引侧：`TextEmbedding.embed(texts)` → `list[list[float]]` |
+| `embed_query` | L25-27 | 检索侧：`TextEmbedding.query_embed(text)`（BGE 的 query 指令前缀由 fastembed 内部处理） |
 
 ### Python 端：`backend/src/aipy/build_knowledge_base.py`（建库脚本）
 
 | 块 | 位置 | 作用 |
 |---|---|---|
-| import config | L10 | 从 `aipy.config` 读路径/模型名/集合名（不再自己算 `parents[2]`） |
+| import config | L9 | 从 `aipy.config` 读路径/模型名/集合名（不再自己算 `parents[2]`） |
+| import embeddings | L10 | `from aipy.embeddings import FastEmbedEmbeddings`（替代原 `langchain_ollama.OllamaEmbeddings`） |
 | 切块器 | L15-18 | `MarkdownHeaderTextSplitter` 按 `##` 切，`strip_headers=False` 保留标题（保证 chunk 自包含） |
 | 读文件切块 | L20-27 | `WIKI_DATA_DIR.glob("*.md")`，每块打 `source` metadata（来源文件名） |
 | 删旧库 | L32-33 | `shutil.rmtree(CHROMA_DIR)` 全量重建，防重复追加 |
-| 向量化入库 | L34-41 | `OllamaEmbeddings(EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)` 编码，`Chroma.from_documents(collection_name=COLLECTION_NAME)` 持久化 |
+| 向量化入库 | L35-41 | `FastEmbedEmbeddings(model_name=EMBEDDING_MODEL)` 编码，`Chroma.from_documents(collection_name=COLLECTION_NAME)` 持久化 |
 | 自测 | L44-49 | 用"夏季晴天能钓到什么鱼？"查 top-2 并打印命中块，肉眼验召回质量 |
 
 ## 四、待办 / 下一步
@@ -347,16 +365,16 @@
 - [ ] 玩家档案 RAG：目前知识库只有游戏通识，还没有玩家个人档案检索。
 - [ ] F7 / `AI ` 前缀写进配置可改，避免和别的 Mod 撞键（已调研：GMCM 有 `AddKeybind`/`AddKeybindList` API，见 libs 接口文件 L103/L112，ModConfig 字段用 `KeybindList` 类型即可，SMAPI 原生支持序列化）。
 - [ ] emotion 现在固定 happy 只打日志（失败时返回 error），后面接表情/立绘显示。
-- [ ] main.py L12 有一行未使用的 `from langchain.chat_models import init_chat_model`，下次改动时顺手清理。
 - [ ] 气泡对话 UI：AI 回复以气泡形式从机器人贴图头上冒出（现为聊天框 / HUD 文字）。
 - [ ] 主动提醒：不对话时 AI 偶尔主动提示玩家（触发机制待定，如体力低 / 节日 / 任务到期）。
 - [ ] 知识库扩充：把星露谷 wiki 内容总结成知识库文档，减少对 wiki 的实时请求。
-- [ ] 面向玩家打包（当前优先级，路线 2）：fastembed 替换 Ollama 嵌入 + PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖。
+- [x] 嵌入改本地 ONNX（2026-10-15）：`OllamaEmbeddings`(bge-m3, 1024 维) → `FastEmbedEmbeddings`(`BAAI/bge-small-zh-v1.5`, 512 维, int8 ~23MB)；新增 `aipy/embeddings.py` 封装，`config.py` 换模型常量并移除 `OLLAMA_BASE_URL`，`chroma_db/` 全量重建；经 5 组问题验证检索质量（鱼类/礼物命中准确，季节类问题受 KB 结构限制）。
+- [ ] 面向玩家打包（当前优先级，路线 2）：PyInstaller 打包 exe + C# 自动拉起后端 + `/health` 就绪检测，做到玩家零环境依赖。
 
 ## 五、环境备忘
 
 - Python 后端目录：`D:\StardewValley_AI_Companion\backend`（与本 Mod 同一个根仓库），入口 `main.py`，FastAPI + uvicorn，uv 管理依赖，Python >=3.11。
-- Ollama 模型：嵌入固定用 `bge-m3`（必装，RAG 向量化）；对话模型本地模式用 `qwen2.5:3b`，云端模式不需要本地对话模型，两个模型都要先 `ollama pull`。
+- 嵌入模型：fastembed `BAAI/bge-small-zh-v1.5`（ONNX int8，~23MB），随 Python 依赖自带、无需 Ollama；首次建库自动下载到系统临时目录的 `fastembed_cache`（国内先设 `HF_ENDPOINT=https://hf-mirror.com`）。Ollama 只在"本地对话模式"下需要（`qwen2.5:3b`），云端模式不需要本地对话模型。
 - LLM 配置：真实配置文件是 `backend/src/aipy/config.json`（⚠️ 不在项目根），模板 `backend/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
 - 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `backend/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。

@@ -25,3 +25,7 @@ mod/draw/
 *.log
 .DS_Store
 Thumbs.db
+
+# ===== 发布包组装 =====
+# release/ 是 tools/build_release.py 的输出目录（几百 MB，随时可重建，不入库）
+release/

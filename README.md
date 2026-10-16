@@ -64,8 +64,8 @@ AI 会实时读取游戏状态（名字、体力、血量、时间、日期、�
 **关键设计**：
 - **双入口复用同一套后端流程**：聊天框提问经 Harmony 补丁（`ChatBox.textBoxEnter(string)` 的 Prefix）截获，`"AI "` 前缀才拦截，其他消息原样放行；F7 测试问题池逻辑独立保留
 - **LLM 工厂模式**：[llm_factory.py](backend/src/aipy/llm_factory.py) 启动时读 `config.json`，按 `provider` 创建 `ChatOllama` 或 `ChatOpenAI`（四个云端厂商的 base_url 已内置预设）；嵌入模型始终用本地 fastembed 的 `bge-small-zh-v1.5`（ONNX 随后端自带），与对话模型选型、是否装 Ollama 无关
-- **游戏内配置（GMCM）**：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# 推送到后端 `POST /config` → 写 `config.json` + 重建 LLM 注入对话图，无需重启；后端未启动时配置只存本地 ModConfig.json，启动后需重新保存
-- **后端自动拉起**：GMCM 里填 `后端目录路径`（backend 文件夹绝对路径）+ 开 `自动启动后端` 后，进游戏 C# 先探活 `GET /health`，后端没起就自动用 uv 拉起并轮询等就绪（最多 30 秒），日志落 `backend/backend.log`；游戏退出时自动关闭 C# 拉起的后端进程（手动启动的不受影响）
+- **游戏内配置（GMCM）**：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# 推送到后端 `POST /config` → 写 `config.json` + 重建 LLM 注入对话图，无需重启；后端未启动时配置只存本地游戏侧 config.json，启动后需重新保存
+- **后端自动拉起**：进游戏 C# 先探活 `GET /health`，后端没起就自动拉起（**双模式**：`BackendDir` 下有 `backend.exe` → 打包模式直接跑 exe，玩家侧零依赖；没有 → 开发模式 `uv run`），轮询等就绪（最多 30 秒），日志落 `backend/backend.log`；游戏退出时自动关闭 C# 拉起的后端进程（手动启动的不受影响）。`BackendDir` 留空时自动推断为 Mod 目录下的 `backend/`（发布形态默认位置）
 - `await` 之后的代码运行在线程池后台线程，所有 UI 操作（HUD / 聊天框）通过主线程任务队列（`Queue<Action>` + `UpdateTicked`）调度回游戏主线程执行，避免随机崩溃
 - 全局复用单个 `HttpClient`，15 秒超时，请求期间游戏照常运行不卡顿
 - 向量库在后端启动时只加载一次；每次请求先做向量检索（top-3），把参考资料片段和游戏状态一起注入提示词
@@ -95,7 +95,8 @@ AI_Projects/
 │   │   ├── embeddings.py      # 本地嵌入封装：fastembed（ONNX）实现 LangChain Embeddings
 │   │   └── build_knowledge_base.py  # 建库脚本：wiki_data → chroma_db
 │   ├── data/                  # 对话历史 SQLite（checkpoints.db，本地生成，已 gitignore）
-│   └── chroma_db/             # 向量库（脚本本地生成，已 gitignore）
+│   ├── chroma_db/             # 向量库（脚本本地生成，已 gitignore）
+│   └── models/                # 嵌入模型缓存（fastembed 下载/随包分发，已 gitignore）
 ├── mod/                 # C# SMAPI Mod
 │   ├── ModTemplate/
 │   │   ├── ModEntry.cs        # Mod 入口：F7/聊天框两条对话流程、GMCM 配置、浮动精灵、线程队列、HTTP 请求
@@ -153,12 +154,12 @@ AI_Projects/
 
 ## 配置文件说明
 
-项目涉及 **两个配置文件**，**两份都包含明文 API Key，都不应提交到 Git**：
+项目涉及 **两个同名但内容不同的 `config.json`**（⚠️ 注意：游戏侧 SMAPI 生成的文件就叫 `config.json`，不是 `ModConfig.json`——类名是 ModConfig 而已），**两份都包含明文 API Key，都不应提交到 Git**：
 
-| 文件 | 位置 | 用途 | 谁写 |
+| 文件 | 位置 | 内容 | 谁写 |
 |---|---|---|---|
-| `ModConfig.json` | `Mods/StardewAIAssistant/`（游戏侧） | 游戏读取，决定推送给后端的配置 | GMCM 保存时自动写入 |
-| `config.json` | `backend/`（后端根） | 后端读取，决定用哪个 LLM；打包模式下在 exe 同级目录 | 后端收到推送后自动写入 |
+| `config.json`（游戏侧） | `Mods/StardewAIAssistant/` | Provider / ApiKey / Model / Temperature / BackendDir / AutoStartBackend | GMCM 保存时自动写入（SMAPI 默认文件名） |
+| `config.json`（后端侧） | `backend/`（开发模式）或 exe 同级（打包模式） | provider / api_key / model / temperature | 后端收到 GMCM 推送后自动写入 |
 
 **首次配置流程**：
 1. 启动 Python 后端（`uv run uvicorn main:app --reload --port 8000`）
@@ -166,7 +167,7 @@ AI_Projects/
 3. 填入 Provider / API Key / Model / Temperature，点保存
 4. 两个配置文件会自动生成，之后无需再填
 
-**如果你没装 GMCM**，可以手动创建 `Mods/StardewAIAssistant/ModConfig.json`：
+**如果你没装 GMCM**，可以手动创建 `Mods/StardewAIAssistant/config.json`：
 ```json
 {
   "Provider": "deepseek",
@@ -233,7 +234,7 @@ uv run python src/aipy/build_knowledge_base.py
    - **模型名**：如 `deepseek-chat` / `qwen-plus` / `glm-4-flash` / `qwen2.5:3b`
    - **回答温度**：0.0-2.0（步长 0.1），越高越有创意但越容易胡说，推荐 0.5-0.9
 4. 保存 → C# 自动推送到后端 `POST /config` → 写 `config.json` + 重建 LLM，**无需重启后端**
-5. 后端未启动时保存：配置只写本地 `ModConfig.json`，HUD 提示"后端未启动，配置已保存到本地；启动后端后请重新保存"
+5. 后端未启动时保存：配置只写本地游戏侧 `config.json`，HUD 提示"后端未启动，配置已保存到本地；启动后端后请重新保存"
 
 **方式二：手动编辑配置文件（无 GMCM 时）**
 
@@ -296,7 +297,7 @@ uv run pyinstaller backend.spec --noconfirm
 
 > 注意命令必须是 `uv run uvicorn ...`，直接写 `uv uvicorn` 会报 `unrecognized subcommand 'uvicorn'`。
 >
-> **嫌每次手动启动麻烦？** 编译好 Mod 后可以在游戏内配置自动拉起：ESC → Mod 选项 → 「后端目录路径」填 backend 文件夹的绝对路径，保持「自动启动后端」开启，之后进游戏会自动拉起 / 退出游戏自动关闭，无需手动操作。
+> **嫌每次手动启动麻烦？** 编译好 Mod 后可以在游戏内配置自动拉起：ESC → Mod 选项 → 保持「自动启动后端」开启。「后端目录路径」可留空（自动用 Mod 目录下的 `backend/`，发布形态默认位置），也可填 backend 文件夹绝对路径（开发时用源码目录）。进游戏自动拉起（目录下有 `backend.exe` 走打包模式，否则走 uv 开发模式）/ 退出游戏自动关闭，无需手动操作。
 
 ### 5. 编译并部署 Mod
 
@@ -386,7 +387,7 @@ dotnet build
 - `provider` 白名单：`ollama` / `deepseek` / `zhipu` / `qwen` / `kimi`，其他值返回 400
 - `provider != ollama` 时 `api_key` 必填，`model` 必填；`temperature` 必须在 0.0-2.0；校验失败返回 400 + 错误详情
 - 成功：写 `backend/config.json` → 重建 LLM → 重新注入对话图，返回 `{"status": "ok", "provider": ..., "model": ..., "temperature": ...}`；**对话历史（SQLite）保留，不重建 graph**
-- C# 端 GMCM 保存时自动推送；后端未启动时 C# 只写本地 `ModConfig.json`
+- C# 端 GMCM 保存时自动推送；后端未启动时 C# 只写本地游戏侧 `config.json`
 
 注意事项：
 - `/chat` 的 `GameTime` 为游戏内时间，`600` 表示早上 6:00
@@ -415,7 +416,8 @@ dotnet build
 - [x] 后端生命周期打通（2026-10-15）：`GET /health` 零开销探活 + C# 启动时检测 / 自动拉起（uv，轮询最多 30 秒，日志落 `backend.log`）/ 游戏退出自动关闭自己拉起的进程；GMCM 新增「后端目录路径」「自动启动后端」
 - [x] 后端打包准备就绪（2026-10-15）：`main.py` 内置程序入口（`python main.py` / 双击 exe 直接跑，无需命令行参数）；嵌入模型缓存固定到 `backend/models/`（已下载则离线加载，打包随包分发零下载）；`chroma_db` 缺失时不再崩溃——跳过检索，AI 回答"不清楚"并打印建库指引
 - [x] PyInstaller 打包第一阶段（2026-10-15）：`backend.spec`（onedir）构建 `dist/backend/backend.exe`，exe 同级放 chroma_db/models/config.json 即发布形态；实测 /health 200 + /chat 检索问答全链路通过（chromadb 动态导入需 `collect_submodules`，见 NOTES 踩坑 27）
-- [ ] **面向玩家打包（当前优先级，路线 2）**：组装发布包（exe + Mod + 数据）+ 把"自动拉起 uv"换成"拉起打包好的 exe" + 体积优化，做到玩家零环境依赖
+- [x] C# 双模式启动（2026-10-16）：`StartBackendAsync` 自动判断——`BackendDir` 下有 `backend.exe` 走打包模式（玩家零依赖），否则回退 `uv run` 开发模式；`BackendDir` 留空自动推断为 Mod 目录下 `backend/`
+- [ ] **面向玩家打包（当前主线）**：组装发布包（`Mods/StardewAIAssistant/backend/` = exe + 数据，Mod 目录自带后端）+ 体积优化，做到玩家解压即用、零环境依赖
 
 ## 常见问题
 

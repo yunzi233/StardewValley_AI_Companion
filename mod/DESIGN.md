@@ -103,4 +103,5 @@ C# 收到 {reply, emotion}
 - [x] 后端生命周期打通（2026-10-15）：`GET /health` 零开销探活；C# 启动时检测 → 不可达按 GMCM 配置自动用 uv 拉起（轮询最多 30 秒，日志落 `backend.log`）→ 游戏退出（`AppDomain.ProcessExit`，SMAPI 4 已移除 GameLoop.Exiting）Kill 自己拉起的进程树；GMCM 新增 BackendDir / AutoStartBackend
 - [x] 后端打包准备就绪（2026-10-15）：`main.py` 内置程序入口（exe 双击直跑）；嵌入模型缓存固定 `backend/models/`（离线优先、随包分发）；`chroma_db` 缺失不崩（空检索兜底，AI 回答"不清楚"）
 - [x] PyInstaller 打包第一阶段（2026-10-15）：`backend.spec`（onedir）→ `dist/backend/backend.exe`，exe 同级放 chroma_db/models/config.json 即发布形态；实测 /health 200 + /chat 全链路通过（chromadb 动态导入需 collect_submodules，NOTES 踩坑 27）
-- [ ] **面向玩家打包（当前优先级，路线 2）**：组装发布包（exe + Mod DLL + 数据）+ 把"自动拉起 uv"换成"拉起打包好的 exe" + 体积优化，做到玩家零环境依赖
+- [x] C# 双模式启动（2026-10-16）：`StartBackendAsync` 自动判断——`BackendDir` 下有 `backend.exe` 走打包模式（玩家零依赖），否则回退 `uv run`；`BackendDir` 留空自动推断为 Mod 目录下 `backend/`
+- [ ] **面向玩家打包（当前主线）**：组装发布包（`Mods/StardewAIAssistant/backend/` = exe + 数据）+ 体积优化，做到玩家解压即用、零环境依赖

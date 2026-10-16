@@ -152,6 +152,21 @@
     - 解决：spec 里 `collect_submodules("chromadb")` 一网打尽——只收集 .py 模块，体积可控；**别用 collect_all**（会把测试数据冗余资源全塞进去）。同理 uvicorn 的 `loops/protocols/lifespan` 也是运行时动态挑选实现，要在 hiddenimports 里显式列 `.auto` + 具体实现模块（如 `uvicorn.protocols.http.h11_impl`）。
     - 附带：数据文件（chroma_db/models/config.json）**不打进 exe**，放 exe 同级目录即可——config.py 的 frozen 分支让 PROJECT_ROOT=exe 所在目录，exe 同级就是"项目根"；验证 exe 别用"命令结束即回收子进程"的终端包装器，要用独立后台任务持有进程再测 /health。
 
+28. **SMAPI 的配置文件默认叫 `config.json`（不是类名 `ModConfig.json`）**
+    - 现象：文档/代码注释里长期写 `ModConfig.json`，实际玩家目录里 SMAPI 生成的是 `Mods/StardewAIAssistant/config.json`——按文档找文件找不到。
+    - 根因：`helper.ReadConfig<ModConfig>()` / `WriteConfig` 的默认文件名就是 `config.json`，类名 ModConfig 只是 C# 类型名，不决定磁盘文件名。
+    - 解决：文档里统一区分两个同名 `config.json`——游戏侧 `Mods/StardewAIAssistant/config.json`（Provider/ApiKey/Model/Temperature/BackendDir/AutoStartBackend，SMAPI 默认文件名）vs 后端侧 `backend/config.json`（provider/api_key/model/temperature，aipy.config.CONFIG_FILE）；README 配置文件表格已更新。
+
+29. **`uvicorn.run()` 阻塞：`if __name__ == "__main__"` 块必须放文件末尾**
+    - 现象：main.py 里把入口块插在 /chat 和 /config 两个路由之间，启动后 GET /config 直接 404。
+    - 根因：`uvicorn.run(app, ...)` 阻塞在当前行，写在中间会导致后面的 `@app.post` 装饰器根本执行不到，路由注册丢失。
+    - 解决：入口块永远放文件末尾（所有路由注册之后）；开发调试用 `uv run uvicorn main:app`（uvicorn 命令行自己 import main 模块，不经过 `__main__` 块），打包 exe 才走 `python main.py` / 双击 exe 走 `__main__`。
+
+30. **PyInstaller 打包后 `Path(__file__)` 失效，PROJECT_ROOT 必须按 `sys.frozen` 分支**
+    - 现象：打包后所有从 `Path(__file__)` 派生的路径（chroma_db / models / config.json）全部错位。
+    - 根因：PyInstaller 下 `__file__` 指向临时解包目录（onedir 的 `_internal/`），不是 exe 所在目录；玩家改配置、换知识库需要在 exe 同级操作，不可能去 `_internal/` 里找。
+    - 解决：`config.py` 的 `PROJECT_ROOT` 加 frozen 分支——`getattr(sys, "frozen", False)` 为 True（打包模式）时用 `Path(sys.executable).resolve().parent`，exe 同级即"项目根"；开发模式保持 `Path(__file__).resolve().parents[2]`。所有派生常量（CHROMA_DIR / MODELS_DIR / CONFIG_FILE / CHECKPOINT_DB / WIKI_DATA_DIR）不用改，自动跟随。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -405,7 +420,7 @@
 - Python 后端目录：`D:\StardewValley_AI_Companion\backend`（与本 Mod 同一个根仓库），入口 `main.py`，FastAPI + uvicorn，uv 管理依赖，Python >=3.11。
 - 嵌入模型：fastembed `BAAI/bge-small-zh-v1.5`（ONNX int8），随 Python 依赖自带、无需 Ollama；模型缓存固定在 `backend/models/`（gitignore，打包随包分发；开发模式首次下载到该目录，国内先设 `HF_ENDPOINT=https://hf-mirror.com`）。Ollama 只在"本地对话模式"下需要（`qwen2.5:3b`），云端模式不需要本地对话模型。
 - LLM 配置：真实配置文件是 `backend/config.json`（2026-10-15 起与模板同在 backend/ 根，旧"必须在 src/aipy/ 下"的规则已废除，见踩坑 17），模板 `backend/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
-- 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地 `ModConfig.json`，启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
+- 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地游戏侧 `config.json`（SMAPI 默认文件名，不是 ModConfig.json），启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `backend/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
 - 启动：三种方式——① 手动：在 `D:\StardewValley_AI_Companion\backend` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）或等价 `uv run python main.py`；② 自动：GMCM 填 BackendDir + 开 AutoStartBackend，进游戏 C# 自动用 uv 拉起（日志落 `backend/backend.log`，游戏退出时自动关闭）；③ 打包 exe：`uv run pyinstaller backend.spec --noconfirm` 后双击 `dist/backend/backend.exe`（数据文件放 exe 同级，见踩坑 27 附带）。
 - 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 17 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/CurrentTool/FarmingLevel/MiningLevel/DaysPlayed/Inventory/NPCAffection/CurrentQuest/Message；返回小写 `{"reply":..., "emotion":...}`。另有 `GET /health`（启动检测用，零开销：不检索不调 LLM，返回 `{"status":"ok","llm_configured":bool,"provider":str}`，注意 provider 在运行中切换配置后可能滞后）与 `POST /config`。改字段两头要一起改，且改完 C# 别忘了重新 build。

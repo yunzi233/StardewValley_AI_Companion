@@ -3,8 +3,8 @@
 ## 你需要什么
 
 1. 星露谷物语
-2. SMAPI
-3. GenericModConfigMenu
+2. [SMAPI](https://smapi.io/)（Mod 加载器，官网下载）
+3. [GenericModConfigMenu](https://www.nexusmods.com/stardewvalley/mods/5098)（游戏内配置界面，N 网下载）
 
 ## 安装步骤
 
@@ -32,7 +32,7 @@
 | 没提示"已上线" | 后端启动慢，等 30 秒；还不行看 `Mods/StardewAIAssistant/backend/backend.log` |
 | 提示"没配置 AI 厂商" | ESC → Mod 选项里填 API Key |
 | 提示"后端未启动" | 杀毒软件可能拦截了 backend.exe，去杀软里加白名单 |
-| 游戏崩溃 | 先移除 Mod 试试；把报错发到 [issue 链接占位] |
+| 游戏崩溃 | 先移除 Mod 试试；把报错发到 [GitHub Issues](https://github.com/yunzi233/StardewValley_AI_Companion/issues) |
 
 ## 数据来源
 

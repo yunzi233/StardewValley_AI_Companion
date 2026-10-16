@@ -693,6 +693,7 @@ namespace StardewAIAssistant
             // 情况 1：玩家关掉了自动启动 → 提醒手动启动
             if (!_config.AutoStartBackend)
             {
+                Monitor.Log("[AI伴侣] 后端不可达且自动启动已关闭，跳过拉起", LogLevel.Info);
                 EnqueueHudMessage("AI 伴侣：后端未启动（自动启动已关闭），请手动运行后端", isError: true);
                 return;
             }
@@ -700,6 +701,7 @@ namespace StardewAIAssistant
             // 情况 2：没填后端目录 → 提醒去 GMCM 填
             if (string.IsNullOrWhiteSpace(_config.BackendDir))
             {
+                Monitor.Log("[AI伴侣] 后端不可达且未配置 BackendDir，跳过拉起", LogLevel.Info);
                 EnqueueHudMessage("AI 伴侣：未配置后端目录，请在 ESC → Mod 选项里填写 backend 路径", isError: true);
                 return;
             }
@@ -710,47 +712,78 @@ namespace StardewAIAssistant
             if (!started)
                 return; // 失败原因已在 StartBackendAsync 里用 HUD 提示过
 
-            // 就绪后复查 LLM 配置情况，给对应的上线提示
+            // 就绪后复查 LLM 配置情况，给对应的上线提示。
+            // 成功走聊天框（OnGameLaunched 在标题界面触发，HUD 消息此时不显示会被丢弃；
+            // 聊天框消息可靠）。错误提示仍走 HUD——玩家进游戏后会重试操作。
             var (_, llmOk) = await CheckBackendHealthAsync();
             if (!llmOk)
                 EnqueueHudMessage("AI 伴侣：后端已上线，但还没配置 AI 厂商和 Key（ESC → Mod 选项）", isError: true);
             else
-                EnqueueHudMessage("AI 伴侣已上线！");
+                EnqueueChatMessage("AI 伴侣已上线！", ChatReplyColor);
         }
 
         /// <summary>
-        /// 尝试用 uv 拉起 Python 后端并轮询 /health 等待就绪（最多 30 秒）。
+        /// 拉起 Python 后端并轮询 /health 等待就绪（最多 30 秒）。
+        /// 自动二选一启动方式：
+        ///   - 发布模式：backendDir/backend.exe 存在 → 直接跑 PyInstaller 打包的 exe（玩家侧零依赖，无需 uv/Python）
+        ///   - 开发模式：没有 exe → uv run uvicorn（源码 backend/ 目录）
         /// 返回是否成功就绪；任何异常都转为 HUD 提示 + false，不向调用方抛。
         /// 拉起的进程记录到 _backendProcess，游戏退出时由 OnGameExiting 负责关闭。
         /// </summary>
         private async Task<bool> StartBackendAsync()
         {
+            // 1. 决定后端目录：GMCM 填了就用填的；没填就用 Mod 目录下的 backend/（发布形态默认位置）
             string backendDir = _config.BackendDir.Trim().TrimEnd('\\', '/');
+            if (string.IsNullOrWhiteSpace(backendDir))
+                backendDir = Path.Combine(Helper.DirectoryPath, "backend");
 
-            // 1. 校验目录存在（GMCM 里填错路径是常见操作，先拦一道）
-            if (!Directory.Exists(backendDir))
-            {
-                EnqueueHudMessage("AI 伴侣：后端目录不存在，请检查 ESC → Mod 选项里的路径", isError: true);
-                return false;
-            }
+            // 2. 决定启动方式：目录下有打包好的 backend.exe → 发布模式；没有 → 开发模式
+            string exePath = Path.Combine(backendDir, "backend.exe");
+            bool useExe = File.Exists(exePath);
 
-            try
+            ProcessStartInfo psi;
+            if (useExe)
             {
-                // 2. 构造启动信息：等效于在 backend 目录下执行 `uv run uvicorn main:app --port 8000`。
-                //    UseShellExecute=false 才能重定向输出；重定向后必须持续读流，
-                //    否则管道缓冲区写满后 Python 会被阻塞卡死（见下方两个 PumpStream 任务）。
-                var psi = new ProcessStartInfo
+                // 发布模式：双击即可跑，不需要 uv、不需要 Python 环境
+                psi = new ProcessStartInfo
                 {
-                    FileName = "uv",
-                    Arguments = "run uvicorn main:app --port 8000",
+                    FileName = exePath,
                     WorkingDirectory = backendDir,
                     UseShellExecute = false,
                     CreateNoWindow = true,           // 不弹黑框
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                 };
+                Monitor.Log($"[AI伴侣] 使用打包模式启动后端：{exePath}", LogLevel.Info);
+            }
+            else
+            {
+                // 开发模式：走 uv。先校验目录存在（GMCM 里填错路径是常见操作，先拦一道）
+                if (!Directory.Exists(backendDir))
+                {
+                    Monitor.Log($"[AI伴侣] 后端目录不存在：{backendDir}", LogLevel.Warn);
+                    EnqueueHudMessage("AI 伴侣：后端目录不存在，请检查 ESC → Mod 选项里的路径", isError: true);
+                    return false;
+                }
 
-                // 3. 启动进程。最常见失败：uv 没装或不在 PATH（Win32Exception）
+                // UseShellExecute=false 才能重定向输出；重定向后必须持续读流，
+                // 否则管道缓冲区写满后 Python 会被阻塞卡死（见下方两个 PumpStream 任务）。
+                psi = new ProcessStartInfo
+                {
+                    FileName = "uv",
+                    Arguments = "run uvicorn main:app --port 8000",
+                    WorkingDirectory = backendDir,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                Monitor.Log($"[AI伴侣] 使用开发模式启动后端（uv）：{backendDir}", LogLevel.Info);
+            }
+
+            try
+            {
+                // 3. 启动进程。开发模式最常见失败：uv 没装或不在 PATH（Win32Exception）
                 Process process;
                 try
                 {
@@ -758,7 +791,10 @@ namespace StardewAIAssistant
                 }
                 catch (Exception ex)
                 {
-                    EnqueueHudMessage("AI 伴侣：拉起失败，找不到 uv，请确认已安装 uv 并加入 PATH", isError: true);
+                    if (!useExe)
+                        EnqueueHudMessage("AI 伴侣：拉起失败，找不到 uv，请确认已安装 uv 并加入 PATH", isError: true);
+                    else
+                        EnqueueHudMessage("AI 伴侣：拉起失败，无法启动 backend.exe（可能被安全软件拦截）", isError: true);
                     Monitor.Log($"启动后端失败：{ex.Message}", LogLevel.Warn);
                     return false;
                 }
@@ -832,24 +868,24 @@ namespace StardewAIAssistant
         /// entireProcessTree 连 uv 派生的 python 子进程一起杀。
         /// 只处理 _backendProcess 里记录的进程，玩家手动启动的后端不受影响。
         /// 注意：本方法在 CLR 关闭阶段执行，有约 2 秒时限，不做任何慢操作。
+        /// ⚠️ 此阶段 SMAPI 日志的 StreamWriter 可能已 Dispose，调 Monitor.Log 会抛
+        ///    ObjectDisposedException（实测崩溃过）——所以整个方法包 try-catch，
+        ///    且内部一个 Monitor.Log 都不调，失败静默放过（游戏已在退，无所谓）。
         /// </summary>
         private void OnProcessExiting(object? sender, EventArgs e)
         {
-            lock (_backendProcessLock)
+            try
             {
-                if (_backendProcess is { HasExited: false } p)
+                lock (_backendProcessLock)
                 {
-                    try
-                    {
+                    if (_backendProcess is { HasExited: false } p)
                         p.Kill(entireProcessTree: true);
-                        Monitor.Log("已关闭自动拉起的后端进程", LogLevel.Info);
-                    }
-                    catch (Exception ex)
-                    {
-                        Monitor.Log($"关闭后端进程失败：{ex.Message}", LogLevel.Warn);
-                    }
+                    _backendProcess = null;
                 }
-                _backendProcess = null;
+            }
+            catch
+            {
+                // 游戏关闭阶段的任何异常都静默吞掉：日志已不可用，弹窗更是不可能
             }
         }
 

@@ -116,6 +116,13 @@ namespace StardewAIAssistant
         /// <summary>保护 _backendProcess 的锁（启动/退出回调可能在不同线程）。</summary>
         private readonly object _backendProcessLock = new();
 
+        /// <summary>
+        /// 后端日志写入器：持有 backend.log 的文件句柄。
+        /// 不能每次启动都 new 一个不释放——Windows 下第二个 writer 以 append:false
+        /// 打开同一文件会抛 IOException（句柄被占）。进程退出时必须 Dispose 释放。
+        /// </summary>
+        private StreamWriter? _backendLogWriter;
+
         public override void Entry(IModHelper helper)
         {
             // 0. 保存单例，供 Harmony 静态补丁使用
@@ -688,9 +695,9 @@ namespace StardewAIAssistant
                 return;
             }
 
-            // ---- 后端不可达，分三种情况处理 ----
+            // ---- 后端不可达 ----
 
-            // 情况 1：玩家关掉了自动启动 → 提醒手动启动
+            // 玩家关掉了自动启动 → 提醒手动启动
             if (!_config.AutoStartBackend)
             {
                 Monitor.Log("[AI伴侣] 后端不可达且自动启动已关闭，跳过拉起", LogLevel.Info);
@@ -698,15 +705,11 @@ namespace StardewAIAssistant
                 return;
             }
 
-            // 情况 2：没填后端目录 → 提醒去 GMCM 填
-            if (string.IsNullOrWhiteSpace(_config.BackendDir))
-            {
-                Monitor.Log("[AI伴侣] 后端不可达且未配置 BackendDir，跳过拉起", LogLevel.Info);
-                EnqueueHudMessage("AI 伴侣：未配置后端目录，请在 ESC → Mod 选项里填写 backend 路径", isError: true);
-                return;
-            }
-
-            // 情况 3：目录已填 → 拉起并等就绪
+            // 不再因 BackendDir 为空而拦截：StartBackendAsync 内部会自动推断为
+            // Mod 目录下的 backend/（发布形态默认位置），推断后若既无 backend.exe
+            // 又无源码（pyproject.toml），由它给出"未找到后端"的提示。
+            // 此前这里的"BackendDir 为空 → 直接返回"分支会让推断逻辑成为死代码，
+            // 导致发布模式玩家必须手填各自不同的 Mod 安装路径。
             EnqueueHudMessage("AI 伴侣正在启动后端...");
             bool started = await StartBackendAsync();
             if (!started)
@@ -732,113 +735,152 @@ namespace StardewAIAssistant
         /// </summary>
         private async Task<bool> StartBackendAsync()
         {
-            // 1. 决定后端目录：GMCM 填了就用填的；没填就用 Mod 目录下的 backend/（发布形态默认位置）
-            string backendDir = _config.BackendDir.Trim().TrimEnd('\\', '/');
-            if (string.IsNullOrWhiteSpace(backendDir))
-                backendDir = Path.Combine(Helper.DirectoryPath, "backend");
-
-            // 2. 决定启动方式：目录下有打包好的 backend.exe → 发布模式；没有 → 开发模式
-            string exePath = Path.Combine(backendDir, "backend.exe");
-            bool useExe = File.Exists(exePath);
-
-            ProcessStartInfo psi;
-            if (useExe)
+            // ---------- 幂等检查（防并发重复调用） ----------
+            // 场景：OnGameLaunched 拉起后端后，玩家改 GMCM 配置点保存，save 回调
+            // 又会调 EnsureBackendReadyAsync → 本方法。不拦的话会：
+            //   a) 第二个 StreamWriter 打开同一 backend.log → IOException 崩溃
+            //      （第一个 writer 持句柄未释放，append:false 需独占写）
+            //   b) 没有 a 拦着的话还会再起一个 backend.exe → 8000 端口冲突
+            bool processAlive;
+            lock (_backendProcessLock)
             {
-                // 发布模式：双击即可跑，不需要 uv、不需要 Python 环境
-                psi = new ProcessStartInfo
-                {
-                    FileName = exePath,
-                    WorkingDirectory = backendDir,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,           // 不弹黑框
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                };
-                Monitor.Log($"[AI伴侣] 使用打包模式启动后端：{exePath}", LogLevel.Info);
+                processAlive = _backendProcess is { HasExited: false };
+            }
+            if (processAlive)
+            {
+                Monitor.Log("[AI伴侣] 后端进程已存在，跳过重复启动，仅等待就绪", LogLevel.Info);
+                // 跳过全部启动+日志逻辑，直接走下方公共轮询分支
             }
             else
             {
-                // 开发模式：走 uv。先校验目录存在（GMCM 里填错路径是常见操作，先拦一道）
-                if (!Directory.Exists(backendDir))
+                // 1. 决定后端目录：GMCM 填了就用填的（覆盖默认）；
+                //    没填就用 Mod 目录下的 backend/（发布形态默认位置，自动推断）
+                string backendDir = _config.BackendDir.Trim().TrimEnd('\\', '/');
+                if (string.IsNullOrWhiteSpace(backendDir))
+                    backendDir = Path.Combine(Helper.DirectoryPath, "backend");
+
+                // 2. 决定启动方式：目录下有打包好的 backend.exe → 发布模式；没有 → 开发模式
+                string exePath = Path.Combine(backendDir, "backend.exe");
+                bool useExe = File.Exists(exePath);
+
+                // 3. 既不是发布形态也不是开发形态 → 大概率没装对/路径填错，提前拦截，
+                //    避免 uv 启动报一堆看不懂的错。
+                //    （目录不存在时 File.Exists 自然为 false，顺带覆盖"路径填错"场景）
+                if (!useExe && !File.Exists(Path.Combine(backendDir, "pyproject.toml")))
                 {
-                    Monitor.Log($"[AI伴侣] 后端目录不存在：{backendDir}", LogLevel.Warn);
-                    EnqueueHudMessage("AI 伴侣：后端目录不存在，请检查 ESC → Mod 选项里的路径", isError: true);
+                    Monitor.Log($"[AI伴侣] 未找到后端：{backendDir}（既没有 backend.exe 也没有 pyproject.toml）", LogLevel.Warn);
+                    EnqueueHudMessage("AI 伴侣：未找到后端（既没有 backend.exe 也没有源码），请检查 Mod 是否完整安装", isError: true);
                     return false;
                 }
 
-                // UseShellExecute=false 才能重定向输出；重定向后必须持续读流，
-                // 否则管道缓冲区写满后 Python 会被阻塞卡死（见下方两个 PumpStream 任务）。
-                psi = new ProcessStartInfo
+                ProcessStartInfo psi;
+                if (useExe)
                 {
-                    FileName = "uv",
-                    Arguments = "run uvicorn main:app --port 8000",
-                    WorkingDirectory = backendDir,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                };
-                Monitor.Log($"[AI伴侣] 使用开发模式启动后端（uv）：{backendDir}", LogLevel.Info);
-            }
+                    // 发布模式：双击即可跑，不需要 uv、不需要 Python 环境
+                    psi = new ProcessStartInfo
+                    {
+                        FileName = exePath,
+                        WorkingDirectory = backendDir,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,           // 不弹黑框
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                    };
+                    Monitor.Log($"[AI伴侣] 使用打包模式启动后端：{exePath}", LogLevel.Info);
+                }
+                else
+                {
+                    // 开发模式：uv run uvicorn（此时已确认 pyproject.toml 存在）
+                    // UseShellExecute=false 才能重定向输出；重定向后必须持续读流，
+                    // 否则管道缓冲区写满后 Python 会被阻塞卡死（见下方两个 PumpStream 任务）。
+                    psi = new ProcessStartInfo
+                    {
+                        FileName = "uv",
+                        Arguments = "run uvicorn main:app --port 8000",
+                        WorkingDirectory = backendDir,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                    };
+                    Monitor.Log($"[AI伴侣] 使用开发模式启动后端（uv）：{backendDir}", LogLevel.Info);
+                }
 
-            try
-            {
-                // 3. 启动进程。开发模式最常见失败：uv 没装或不在 PATH（Win32Exception）
-                Process process;
                 try
                 {
-                    process = Process.Start(psi)!;
+                    // 4. 启动进程。开发模式最常见失败：uv 没装或不在 PATH（Win32Exception）
+                    Process process;
+                    try
+                    {
+                        process = Process.Start(psi)!;
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!useExe)
+                            EnqueueHudMessage("AI 伴侣：拉起失败，找不到 uv，请确认已安装 uv 并加入 PATH", isError: true);
+                        else
+                            EnqueueHudMessage("AI 伴侣：拉起失败，无法启动 backend.exe（可能被安全软件拦截）", isError: true);
+                        Monitor.Log($"启动后端失败：{ex.Message}", LogLevel.Warn);
+                        return false;
+                    }
+
+                    // 5. 记录到字段（加锁）：游戏退出时 OnProcessExiting 按它 Kill
+                    lock (_backendProcessLock)
+                    {
+                        _backendProcess = process;
+                    }
+
+                    // 6. 异步读 stdout/stderr 落盘到 backend.log（fire-and-forget）。
+                    //    打开新 writer 前先释放旧 writer（若有）：进程重启场景（上次拉起
+                    //    失败/进程已退出 HasExited=true）会再次走到这里，旧 writer 还
+                    //    占着文件句柄，不先 Dispose 直接打开会抛 IOException。
+                    //    AutoFlush 保证每行立即写盘，进程被 Kill 后日志不丢；
+                    //    两路读流共用一个 writer，写行时加锁；两路都结束后统一 Dispose。
+                    if (_backendLogWriter != null)
+                    {
+                        _backendLogWriter.Dispose();
+                        _backendLogWriter = null;
+                    }
+                    string logPath = Path.Combine(backendDir, "backend.log");
+                    _backendLogWriter = new StreamWriter(logPath, append: false) { AutoFlush = true };
+                    var logWriter = _backendLogWriter;   // 局部引用供后台泵流任务闭包捕获
+                    var logLock = new object();
+                    _ = Task.WhenAll(
+                        PumpStreamAsync(process.StandardOutput, logWriter, logLock, "stdout"),
+                        PumpStreamAsync(process.StandardError, logWriter, logLock, "stderr")
+                    ).ContinueWith(_ => logWriter.Dispose());
                 }
                 catch (Exception ex)
                 {
-                    if (!useExe)
-                        EnqueueHudMessage("AI 伴侣：拉起失败，找不到 uv，请确认已安装 uv 并加入 PATH", isError: true);
-                    else
-                        EnqueueHudMessage("AI 伴侣：拉起失败，无法启动 backend.exe（可能被安全软件拦截）", isError: true);
-                    Monitor.Log($"启动后端失败：{ex.Message}", LogLevel.Warn);
+                    // 兜底：目录校验通过后仍可能出错（如磁盘 IO、权限问题）
+                    EnqueueHudMessage("AI 伴侣：后端启动失败，详情见 SMAPI 日志", isError: true);
+                    Monitor.Log($"启动后端异常：{ex}", LogLevel.Warn);
                     return false;
                 }
+            }
 
-                // 4. 记录到字段（加锁）：游戏退出时 OnGameExiting 按它 Kill
+            // ---------- 公共轮询分支：新建进程与已存活进程共用 ----------
+            // 轮询 /health：每秒一次，最多 30 次（后端要加载向量库，首次启动较慢）
+            for (int i = 0; i < 30; i++)
+            {
+                await Task.Delay(1000);
+                var (ok, _) = await CheckBackendHealthAsync();
+                if (ok)
+                    return true;
+
+                // 进程提前退出（如端口被占、目录里没有 main.py）→ 不必等满 30 秒。
+                // 锁内读字段："跳过启动"分支里该字段不是本调用赋值的，统一走锁
+                bool exitedEarly;
                 lock (_backendProcessLock)
                 {
-                    _backendProcess = process;
+                    exitedEarly = _backendProcess?.HasExited ?? false;
                 }
-
-                // 5. 异步读 stdout/stderr 落盘到 backend.log（fire-and-forget）。
-                //    AutoFlush 保证每行立即写盘，进程被 Kill 后日志不丢；
-                //    两路读流共用一个 writer，写行时加锁；两路都结束后统一 Dispose。
-                string logPath = Path.Combine(backendDir, "backend.log");
-                var logWriter = new StreamWriter(logPath, append: false) { AutoFlush = true };
-                var logLock = new object();
-                _ = Task.WhenAll(
-                    PumpStreamAsync(process.StandardOutput, logWriter, logLock, "stdout"),
-                    PumpStreamAsync(process.StandardError, logWriter, logLock, "stderr")
-                ).ContinueWith(_ => logWriter.Dispose());
-
-                // 6. 轮询 /health：每秒一次，最多 30 次（后端要加载向量库，首次启动较慢）
-                for (int i = 0; i < 30; i++)
-                {
-                    await Task.Delay(1000);
-                    var (ok, _) = await CheckBackendHealthAsync();
-                    if (ok)
-                        return true;
-
-                    // 进程提前退出（如端口被占、目录里没有 main.py）→ 不必等满 30 秒
-                    if (process.HasExited)
-                        break;
-                }
-
-                EnqueueHudMessage("AI 伴侣：后端启动超时，请查看 backend 目录下的 backend.log", isError: true);
-                return false;
+                if (exitedEarly)
+                    break;
             }
-            catch (Exception ex)
-            {
-                // 兜底：目录校验通过后仍可能出错（如磁盘 IO、权限问题）
-                EnqueueHudMessage("AI 伴侣：后端启动失败，详情见 SMAPI 日志", isError: true);
-                Monitor.Log($"启动后端异常：{ex}", LogLevel.Warn);
-                return false;
-            }
+
+            EnqueueHudMessage("AI 伴侣：后端启动超时，请查看 backend 目录下的 backend.log", isError: true);
+            return false;
         }
 
         /// <summary>
@@ -881,6 +923,12 @@ namespace StardewAIAssistant
                     if (_backendProcess is { HasExited: false } p)
                         p.Kill(entireProcessTree: true);
                     _backendProcess = null;
+
+                    // 释放 backend.log 句柄（writer 不 Dispose 会一直占用文件，
+                    // 下次启动/重复调用时打不开）。后台泵流任务的 ContinueWith
+                    // 也会 Dispose 同一个 writer——Dispose 幂等，重复调用不抛。
+                    _backendLogWriter?.Dispose();
+                    _backendLogWriter = null;
                 }
             }
             catch

@@ -111,6 +111,9 @@ AI_Projects/
 │   │   └── StardewAIAssistant.csproj
 │   ├── DESIGN.md              # 设计蓝图（模块规划与数据流）
 │   └── NOTES.md               # 开发笔记（踩坑记录，值得一看）
+├── tools/
+│   └── build_release.py       # 发布包组装脚本（Mod DLL + PyInstaller 产物 + 数据 → zip）
+├── PLAYER-README.md           # 面向玩家的安装说明（打进发布包，包内改名 README.md）
 └── .gitignore
 ```
 
@@ -295,6 +298,19 @@ uv run pyinstaller backend.spec --noconfirm
 
 数据文件不打进 exe：打包模式下 `config.py` 的 `PROJECT_ROOT` 指向 exe 所在目录，exe 同级就是"项目根"，玩家改配置/换知识库都在 exe 旁边操作。
 
+**组装发布包（路线 2 发布形态）**：
+
+```bash
+# 在项目根目录（前置：Mod 已编译 + backend 已 PyInstaller 打包）
+uv run python tools/build_release.py
+# 产物 release/StardewAIAssistant-v0.9.zip（约 149MB / 275 文件）
+# zip 内即完整 Mod 文件夹：StardewAIAssistant.dll + assets/ + manifest.json
+#   + backend/（backend.exe + _internal/ + chroma_db/ + models/ + wiki_data/）
+# 玩家解压到 Mods/ 即可，C# 自动以"打包模式"拉起 exe，全程零环境依赖
+```
+
+脚本幂等可重复执行；自动剔除 `config.json` / `data/` / `backend.log` 等敏感/运行时文件，不会把 API Key 打进包里。
+
 > 注意命令必须是 `uv run uvicorn ...`，直接写 `uv uvicorn` 会报 `unrecognized subcommand 'uvicorn'`。
 >
 > **嫌每次手动启动麻烦？** 编译好 Mod 后可以在游戏内配置自动拉起：ESC → Mod 选项 → 保持「自动启动后端」开启。「后端目录路径」可留空（自动用 Mod 目录下的 `backend/`，发布形态默认位置），也可填 backend 文件夹绝对路径（开发时用源码目录）。进游戏自动拉起（目录下有 `backend.exe` 走打包模式，否则走 uv 开发模式）/ 退出游戏自动关闭，无需手动操作。
@@ -416,8 +432,9 @@ dotnet build
 - [x] 后端生命周期打通（2026-10-15）：`GET /health` 零开销探活 + C# 启动时检测 / 自动拉起（uv，轮询最多 30 秒，日志落 `backend.log`）/ 游戏退出自动关闭自己拉起的进程；GMCM 新增「后端目录路径」「自动启动后端」
 - [x] 后端打包准备就绪（2026-10-15）：`main.py` 内置程序入口（`python main.py` / 双击 exe 直接跑，无需命令行参数）；嵌入模型缓存固定到 `backend/models/`（已下载则离线加载，打包随包分发零下载）；`chroma_db` 缺失时不再崩溃——跳过检索，AI 回答"不清楚"并打印建库指引
 - [x] PyInstaller 打包第一阶段（2026-10-15）：`backend.spec`（onedir）构建 `dist/backend/backend.exe`，exe 同级放 chroma_db/models/config.json 即发布形态；实测 /health 200 + /chat 检索问答全链路通过（chromadb 动态导入需 `collect_submodules`，见 NOTES 踩坑 27）
-- [x] C# 双模式启动（2026-10-16）：`StartBackendAsync` 自动判断——`BackendDir` 下有 `backend.exe` 走打包模式（玩家零依赖），否则回退 `uv run` 开发模式；`BackendDir` 留空自动推断为 Mod 目录下 `backend/`
-- [ ] **面向玩家打包（当前主线）**：组装发布包（`Mods/StardewAIAssistant/backend/` = exe + 数据，Mod 目录自带后端）+ 体积优化，做到玩家解压即用、零环境依赖
+- [x] C# 双模式启动（2026-10-16）：`StartBackendAsync` 自动判断——`BackendDir` 下有 `backend.exe` 走打包模式（玩家零依赖），否则回退 `uv run` 开发模式；`BackendDir` 留空自动推断为 Mod 目录下 `backend/`（删掉 EnsureBackendReadyAsync 里的空值拦截死代码，推断逻辑真正生效）；并发调用幂等（重复触发不再崩 backend.log / 不再重复起进程，见 NOTES 踩坑 31）
+- [x] 发布包组装（2026-10-16）：`tools/build_release.py` 一键产出 `release/StardewAIAssistant-v0.9.zip`（Mod DLL + PyInstaller onedir 产物 + chroma_db/models/wiki_data，敏感文件自动剔除）+ `PLAYER-README.md` 玩家向安装说明
+- [ ] **面向玩家打包（当前主线）**：发布包实测（纯净环境解压即用验证）+ PLAYER-README 链接填写 + 体积优化
 
 ## 常见问题
 
@@ -431,7 +448,8 @@ dotnet build
 | 输入 `AI 问题` 被当成普通聊天发出去 | Harmony 补丁未生效：看 SMAPI 启动日志有无补丁加载记录；确认 `dotnet build` 后 Mods 目录 DLL 已更新 |
 | HUD 提示「AI大脑连接失败」 | Python 后端未启动或端口不是 8000。可在 GMCM 填「后端目录路径」开启自动拉起；或手动启动后端 |
 | HUD 提示「后端启动超时」 | 查看 `backend/backend.log` 定位：常见原因是端口被占（残留了旧后端进程）、目录里没有 main.py、或首次拉起时 uv 要解析依赖超过 30 秒 |
-| HUD 提示「拉起失败，找不到 uv」 | uv 未安装或不在 PATH：重开终端执行 `uv --version` 验证；游戏进程继承的 PATH 需包含 uv 所在目录 |
+| HUD 提示「拉起失败，找不到 uv」 | uv 未安装或不在 PATH：重开终端执行 `uv --version` 验证；游戏进程继承的 PATH 需包含 uv 所在目录（仅开发模式需要 uv，打包模式走 exe 不需要） |
+| HUD 提示「未找到后端（既没有 backend.exe 也没有源码）」 | 后端目录下既无 `backend.exe` 也无 `pyproject.toml`：发布包玩家 = Mod 没装完整（重新解压 zip）；开发者 = GMCM「后端目录路径」填错了 |
 | 后端日志报 Ollama 连接错误 | 仅当对话 provider=`ollama` 时才需要 Ollama：确认服务已运行（默认端口 11434）或执行 `ollama serve`。注意：嵌入已改用 fastembed，检索不再依赖 Ollama |
 | 后端启动报找不到 `chroma_db` / 集合为空 | 还没建知识库，先跑 `uv run python src/aipy/build_knowledge_base.py` |
 | 建库时下载嵌入模型超时（`Could not download model ... from any source`） | 国内访问 HuggingFace 超时；先设镜像 `$env:HF_ENDPOINT="https://hf-mirror.com"` 再重跑建库脚本 |

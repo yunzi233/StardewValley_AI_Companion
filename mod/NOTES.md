@@ -167,6 +167,18 @@
     - 根因：PyInstaller 下 `__file__` 指向临时解包目录（onedir 的 `_internal/`），不是 exe 所在目录；玩家改配置、换知识库需要在 exe 同级操作，不可能去 `_internal/` 里找。
     - 解决：`config.py` 的 `PROJECT_ROOT` 加 frozen 分支——`getattr(sys, "frozen", False)` 为 True（打包模式）时用 `Path(sys.executable).resolve().parent`，exe 同级即"项目根"；开发模式保持 `Path(__file__).resolve().parents[2]`。所有派生常量（CHROMA_DIR / MODELS_DIR / CONFIG_FILE / CHECKPOINT_DB / WIKI_DATA_DIR）不用改，自动跟随。
 
+31. **StartBackendAsync 并发重复调用：backend.log 被占用 + 重复起进程**
+    - 现象：填了 BackendDir 后保存 GMCM，日志显示 StartBackendAsync 被调两次（OnGameLaunched + save 回调的 EnsureBackendReadyAsync），第二次抛 `IOException: The process cannot access the file '...\backend.log' because it is being used by another process`。
+    - 根因：a) 第一次打开的 `StreamWriter`（AutoFlush=true）从未 Dispose，一直持有 backend.log 句柄，第二次 `new StreamWriter(path, append:false)` 要独占写 → 冲突；b) 第二次调用不知道 `_backendProcess` 里已存着一个存活进程，没有 a 拦着会再起一个 exe → 8000 端口冲突。
+    - 解决：① writer 提升为字段 `_backendLogWriter`，`OnProcessExiting` 里 Dispose 释放句柄（Dispose 幂等，和泵流任务的 ContinueWith 重复调用不抛）；② 方法开头加幂等检查——锁内读 `_backendProcess is { HasExited: false }`，存活则打日志"后端进程已存在，跳过重复启动，仅等待就绪"，跳过全部启动+开日志逻辑，直接走公共轮询分支；③ 进程重启场景（上次 HasExited=true 再次走到启动逻辑）打开新 writer 前先 Dispose 旧 writer。
+    - 教训：凡是"打开文件句柄 + fire-and-forget 后台任务持有"的资源，句柄所有权要提升到字段级并明确 Dispose 时机；可能并发进入的启动方法先做幂等检查再干活。
+
+32. **BackendDir 空值拦截让自动推断成死代码**
+    - 现象：发布模式下玩家 BackendDir 留空，后端不自动拉起——EnsureBackendReadyAsync 里"BackendDir 为空 → HUD 提示 + return"的分支直接拦截，StartBackendAsync 里"为空则推断为 Mod 目录下 backend/"的逻辑永远走不到。
+    - 根因：判空逻辑在上游 EnsureBackendReadyAsync 写了一份（早期版本），下游 StartBackendAsync 后来加了自动推断，两份策略矛盾，上游的先执行。
+    - 解决：删掉上游的空值拦截分支，目录决策统一收口到 StartBackendAsync；下游补"既无 backend.exe 也无 pyproject.toml → 提示未找到后端"的兜底检查（发布/开发形态各认标志物，目录不存在时 File.Exists 自然为 false，顺带覆盖"路径填错"场景）。
+    - 教训：同一策略的判断只能有一个权威落点，上下游各写一份必有一个变死代码。
+
 ## 二、核心机制备忘
 
 1. **async/await 的线程切换**
@@ -413,7 +425,9 @@
 - [x] 后端生命周期打通（2026-10-15）：Python 端 `GET /health`（不触发检索/LLM，返回 status/llm_configured/provider；`_config` 兜底空 dict 防 NameError）；C# 端 `CheckBackendHealthAsync`（3 秒超时）→ `EnsureBackendReadyAsync`（可达提示 / 不可达按 GMCM 配置自动拉起）→ `StartBackendAsync`（uv 拉起 + 双流写 backend.log + 轮询 30 秒）→ 退出钩子 `AppDomain.ProcessExit` Kill 进程树（SMAPI 4 无 GameLoop.Exiting，见踩坑 26）；GMCM 新增 BackendDir / AutoStartBackend 两配置项。
 - [x] 后端打包准备就绪（2026-10-15）：`main.py` 末尾内置 `__main__` 入口（`uvicorn.run(app, "127.0.0.1", 8000)`，**必须放在所有路由注册之后**，放中间会被 run 阻塞导致后面的路由注册不到——实测踩过）；嵌入模型缓存固定 `backend/models/`（离线优先，实测 `HF_HUB_OFFLINE=1` 可出 512 维向量）；`chroma_db` 缺失时 `_NullRetriever` 兜底不崩（AI 回答"不清楚"）。
 - [x] PyInstaller 打包第一阶段（2026-10-15）：`backend.spec`（onedir，数据文件不打进 exe）→ `dist/backend/backend.exe`；exe 同级放 chroma_db/models/config.json = 发布形态，实测 /health 200 + /chat 检索问答全链路通过（chromadb 全组件动态 import 需 `collect_submodules`，见踩坑 27）；打包命令 `uv run pyinstaller backend.spec --noconfirm`
-- [ ] 面向玩家打包（当前优先级，路线 2）：组装发布包（exe + Mod DLL + 数据文件）+ 把"拉起 uv"换成"拉起打包好的 exe"（改 ModEntry.cs 的 ProcessStartInfo）+ 体积优化，做到玩家零环境依赖。
+- [x] C# 双模式启动（2026-10-16）：`StartBackendAsync` 自动判断——`BackendDir` 下有 `backend.exe` 走打包模式（玩家零依赖），否则回退 `uv run` 开发模式；`BackendDir` 留空自动推断为 Mod 目录下 `backend/`（删掉上游空值拦截死代码，见踩坑 32）；并发调用幂等（writer 提为字段 `_backendLogWriter` + 进程存活检查，见踩坑 31）；目录下既无 exe 又无 pyproject.toml 时提示"未找到后端"。
+- [x] 发布包组装（2026-10-16）：`tools/build_release.py` 一键产出 `release/StardewAIAssistant-v0.9.zip`（约 149MB / 275 文件：Mod DLL + assets + manifest + PyInstaller onedir 产物 + chroma_db/models/wiki_data/config.example.json；自动剔除 config.json/data/backend.log）；`PLAYER-README.md` 玩家向安装说明（打进包内改名 README.md）；项目根 .gitignore 加 `release/`。
+- [ ] 面向玩家打包收尾（当前主线）：发布包纯净环境实测（解压即用）+ PLAYER-README 占位链接填写 + 体积优化。
 
 ## 五、环境备忘
 
@@ -422,7 +436,7 @@
 - LLM 配置：真实配置文件是 `backend/config.json`（2026-10-15 起与模板同在 backend/ 根，旧"必须在 src/aipy/ 下"的规则已废除，见踩坑 17），模板 `backend/config.example.json` 入库、真实 config.json 已 gitignore。provider 可选 ollama/deepseek/zhipu/qwen/kimi；云端四家 base_url 写死在 `src/aipy/llm_factory.py` 的 PROVIDERS 表。**v0.8 起后端无配置也能启动**（PlaceholderLLM 占位），收到 GMCM 推送后自动切换为真实模型，无需重启；temperature 随 /config 一起推送并落盘（0.0-2.0，默认 0.7）。
 - 游戏内配置（GMCM）：玩家 ESC → Mod 选项 → 填厂商/Key/模型/回答温度 → 保存时 C# POST `/config` → 后端写 `config.json` + 重建 LLM 注入对话图；后端未启动时配置只存本地游戏侧 `config.json`（SMAPI 默认文件名，不是 ModConfig.json），启动后需重新保存。GMCM 接口文件必须用 `shared/` 版本（见踩坑 20）。
 - 建知识库：在 `backend/` 下执行 `uv run python src/aipy/build_knowledge_base.py`（注意脚本在 `src/aipy/` 下，不是 scripts/）；输入 `wiki_data/*.md`，输出本地 `chroma_db/`（已 gitignore，换机要重建）。
-- 启动：三种方式——① 手动：在 `D:\StardewValley_AI_Companion\backend` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）或等价 `uv run python main.py`；② 自动：GMCM 填 BackendDir + 开 AutoStartBackend，进游戏 C# 自动用 uv 拉起（日志落 `backend/backend.log`，游戏退出时自动关闭）；③ 打包 exe：`uv run pyinstaller backend.spec --noconfirm` 后双击 `dist/backend/backend.exe`（数据文件放 exe 同级，见踩坑 27 附带）。
+- 启动：三种方式——① 手动：在 `D:\StardewValley_AI_Companion\backend` 下执行 `uv run uvicorn main:app --port 8000`（调试热重载可加 `--reload`；切记是 `uv run`，`uv uvicorn` 会报错）或等价 `uv run python main.py`；② 自动：GMCM 开 AutoStartBackend（BackendDir 可留空，自动推断为 Mod 目录下 `backend/`），进游戏 C# 双模式拉起——目录下有 `backend.exe` 走打包模式直跑 exe，否则走 `uv run` 开发模式（日志落各自目录的 `backend.log`，游戏退出时自动关闭）；③ 打包 exe：`uv run pyinstaller backend.spec --noconfirm` 后双击 `dist/backend/backend.exe`（数据文件放 exe 同级，见踩坑 27 附带）。
 - 接口：`POST http://127.0.0.1:8000/chat`。入参字段故意写成 PascalCase 对齐 C# 序列化输出，共 17 个：PlayerName/Stamina/Health/GameTime/DayOfMonth/Season/IsRaining/Location/Money/CurrentTool/FarmingLevel/MiningLevel/DaysPlayed/Inventory/NPCAffection/CurrentQuest/Message；返回小写 `{"reply":..., "emotion":...}`。另有 `GET /health`（启动检测用，零开销：不检索不调 LLM，返回 `{"status":"ok","llm_configured":bool,"provider":str}`，注意 provider 在运行中切换配置后可能滞后）与 `POST /config`。改字段两头要一起改，且改完 C# 别忘了重新 build。
 - 多轮记忆：LangGraph `AsyncSqliteSaver`（SQLite 落盘 `backend/data/checkpoints.db`），`thread_id` 用玩家名隔离；重启后端历史不丢，删该文件即清空（见核心机制备忘第 7 条、踩坑 19）。
 - Harmony：dll 在 `D:\Steam\steamapps\common\Stardew Valley\smapi-internal\0Harmony.dll`，csproj 显式引用 + `Private=false`；Entry 里 `new Harmony(ModManifest.UniqueID).PatchAll()` 安装。
